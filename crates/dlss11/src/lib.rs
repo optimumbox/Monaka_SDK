@@ -4,7 +4,9 @@
 //! 1. each eye's part of the captured frame and of its depth is copied into render-size textures;
 //! 2. its motion vectors are written from that depth and the eye's camera now and at its previous
 //!    frame ([`monaka_warp::MotionPass`]: the camera's motion only);
-//! 3. the eye's own DLSS feature (one history per eye) upscales it to the eye size.
+//! 3. the eye's own DLSS feature (one history per eye) upscales it to the eye size;
+//! 4. with [`Settings::sharpness`], AMD's CAS sharpens it ([`monaka_warp::SharpenPass`]), as DLSS's
+//!    own sharpening no longer does.
 //!
 //! The projection each eye is drawn with is jittered by [`jitter`] (the same sequence for both
 //! eyes); the frame's [`EyeFrame::jitter`] says by how much. NGX is NVIDIA's runtime in the driver;
@@ -14,11 +16,12 @@
 mod ngx;
 
 use monaka_channel::d3d;
-use monaka_warp::{EyeView, MotionPass};
+use monaka_warp::{EyeView, MotionPass, SharpenPass};
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11UnorderedAccessView,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16G16_FLOAT,
@@ -150,6 +153,8 @@ pub struct Settings {
     pub dll_dirs: Vec<PathBuf>,
     /// 1 or -1: whether DLSS is told the content shift or its opposite.
     pub jitter_sign: f32,
+    /// CAS sharpening 0..1 after DLSS, or none.
+    pub sharpness: Option<f32>,
 }
 
 /// One eye's frame.
@@ -172,7 +177,9 @@ pub struct EyeFrame<'a> {
 
 struct Eye {
     handle: *mut ngx::Handle,
-    output: ID3D11Texture2D,
+    output: (ID3D11Texture2D, ID3D11UnorderedAccessView),
+    /// With sharpening: what DLSS writes, and a view the sharpening reads it by.
+    upscaled: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     previous: Option<EyeView>,
 }
 
@@ -180,6 +187,7 @@ pub struct Dlss11 {
     device: ID3D11Device,
     parameters: *mut ngx::Parameter,
     motion: MotionPass,
+    sharpen: Option<SharpenPass>,
     settings: Settings,
     /// The render-size inputs, shared by both eyes (written and read in turn on one context).
     color: Option<(DXGI_FORMAT, ID3D11Texture2D)>,
@@ -206,6 +214,15 @@ fn with_uav(device: &ID3D11Device, size: (u32, u32), format: DXGI_FORMAT) -> Res
     // SAFETY: a view of our own texture, made with unordered access.
     unsafe { d3d_call("unordered access view", device.CreateUnorderedAccessView(&made, None, Some(&mut view)))? };
     Ok((made, view.ok_or_else(|| Error::Failed("unordered access view".into()))?))
+}
+
+/// A texture DLSS writes and the sharpening reads, with its shader view.
+fn with_srv(device: &ID3D11Device, size: (u32, u32), format: DXGI_FORMAT) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let made = texture(device, size, format, (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_UNORDERED_ACCESS.0) as u32)?;
+    let mut view = None;
+    // SAFETY: a view of our own texture, made with shader-resource binding.
+    unsafe { d3d_call("shader view", device.CreateShaderResourceView(&made, None, Some(&mut view)))? };
+    Ok((made, view.ok_or_else(|| Error::Failed("shader view".into()))?))
 }
 
 /// The plain (not sRGB) format of a colour format's family, as DLSS reads it: an sRGB back buffer's
@@ -279,11 +296,20 @@ impl Dlss11 {
         let depth_in = texture(device, render, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
         let depth = with_uav(device, render, DXGI_FORMAT_R32_FLOAT)?;
         let motion_vectors = with_uav(device, render, DXGI_FORMAT_R16G16_FLOAT)?;
-        let mut this = Self { device: device.clone(), parameters, motion: MotionPass::new(device).map_err(|e| Error::Failed(format!("motion pass: {e}")))?, settings, color: None, depth_in, depth, motion_vectors, eyes: Vec::new() };
+        let sharpen = match settings.sharpness {
+            Some(_) => Some(SharpenPass::new(device).map_err(|e| Error::Failed(format!("sharpening: {e}")))?),
+            None => None,
+        };
+        let motion = MotionPass::new(device).map_err(|e| Error::Failed(format!("motion pass: {e}")))?;
+        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, eyes: Vec::new() };
         for _ in 0..2 {
-            let output = with_uav(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?.0;
+            let output = with_uav(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?;
+            let upscaled = match this.sharpen {
+                Some(_) => Some(with_srv(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?),
+                None => None,
+            };
             let handle = this.create_feature(context)?;
-            this.eyes.push(Eye { handle, output, previous: None });
+            this.eyes.push(Eye { handle, output, upscaled, previous: None });
         }
         Ok(this)
     }
@@ -344,7 +370,8 @@ impl Dlss11 {
         // SAFETY: NGX_D3D11_EVALUATE_DLSS_EXT's own sequence, with our live textures, on our context.
         unsafe {
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Color".as_ptr(), resource(color));
-            ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Output".as_ptr(), resource(&state.output));
+            let written = state.upscaled.as_ref().map_or(&state.output.0, |(t, _)| t);
+            ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Output".as_ptr(), resource(written));
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Depth".as_ptr(), resource(&self.depth.0));
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"MotionVectors".as_ptr(), resource(&self.motion_vectors.0));
             ngx::NVSDK_NGX_Parameter_SetF(p, c"Jitter.Offset.X".as_ptr(), sign * frame.jitter[0]);
@@ -368,8 +395,11 @@ impl Dlss11 {
             ngx::NVSDK_NGX_Parameter_SetF(p, c"FrameTimeDeltaInMsec".as_ptr(), frame.frame_time_ms);
             ngx_call("evaluating DLSS", ngx::NVSDK_NGX_D3D11_EvaluateFeature_C(context.as_raw(), state.handle, p, std::ptr::null()))?;
         }
+        if let (Some(sharpen), Some((_, view)), Some(sharpness)) = (&self.sharpen, &state.upscaled, self.settings.sharpness) {
+            sharpen.run(context, view, &state.output.1, self.settings.display, sharpness);
+        }
         state.previous = Some(frame.view);
-        Ok(state.output.clone())
+        Ok(state.output.0.clone())
     }
 }
 
@@ -417,7 +447,7 @@ mod tests {
         let (device, context, _) = d3d::create_device(None).expect("device");
         let display = (512, 512);
         let render = render_size(display, Quality::Quality);
-        let settings = Settings { render, display, quality: Quality::Quality, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0 };
+        let settings = Settings { render, display, quality: Quality::Quality, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0, sharpness: Some(0.5) };
         let mut dlss = Dlss11::new(&device, &context, settings).expect("DLSS");
         let frame = (render.0 * 2, render.1);
         let colour_desc = D3D11_TEXTURE2D_DESC { BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32, ..d3d::simple_texture_desc(frame.0, frame.1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) };

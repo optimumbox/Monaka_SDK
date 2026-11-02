@@ -2,7 +2,7 @@
 //! second frame filling what the first could not see ([`Reprojector`], for alternate-eye rendering
 //! with depth); a game's HUD as its own layer laid over each eye ([`HudLayer`]); and motion vectors
 //! for temporal upscaling from depth and two cameras of one eye ([`MotionPass`]); a flat frame
-//! resampled to the eye size ([`Scaler`]). The math is in
+//! resampled to the eye size ([`Scaler`]); an upscaled image sharpened ([`SharpenPass`]). The math is in
 //! [`monaka_core::depth`].
 //!
 //! Runs on the game's own immediate context: the compute bindings it changes are saved and put
@@ -27,12 +27,14 @@ mod hud;
 mod motion;
 mod reproject;
 mod scale;
+mod sharpen;
 pub mod reproject12;
 pub mod warp12;
 pub use hud::{HUD_SOURCE, HudLayer};
 pub use motion::{EyeView, MOTION_SOURCE, MotionPass, ObjectMotion};
 pub use reproject::{Frame, REPROJECT_SOURCE, Reprojector, View, source_matrix};
 pub use scale::{SCALE_SOURCE, Scaler, fit};
+pub use sharpen::{SHARPEN_SOURCE, SharpenPass};
 
 #[derive(Debug)]
 pub enum Error {

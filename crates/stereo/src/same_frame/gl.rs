@@ -110,6 +110,8 @@ pub struct GlDlss {
     pub data: &'static Path,
     /// 1 or -1: whether DLSS is told the content shift or its opposite.
     pub jitter_sign: f32,
+    /// CAS sharpening 0..1 after DLSS, or none.
+    pub sharpness: Option<f32>,
 }
 
 /// A frame's eyes as drawn for DLSS: each eye's camera (canonical, metres) and unjittered
@@ -578,10 +580,11 @@ impl State {
                 data_dir: dlss.data.to_path_buf(),
                 dll_dirs: vec![dlss.dlls.to_path_buf()],
                 jitter_sign: dlss.jitter_sign,
+                sharpness: dlss.sharpness,
             };
             match Dlss11::new(&device, context, settings) {
                 Ok(made) => {
-                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye", dlss.quality.name(), render.0, render.1, dlss.display.0, dlss.display.1);
+                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), render.0, render.1, dlss.display.0, dlss.display.1, dlss.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
                     self.upscaler = Some(made);
                     self.dlss_last = [None, None];
                 }
