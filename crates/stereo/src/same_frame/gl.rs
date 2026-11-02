@@ -441,7 +441,12 @@ impl State {
                     Err(e) => return self.fail(format!("flat frame: {e}")),
                 }
             }
-            None if self.dlss.is_some() => match self.dlss_eyes(&context, &image, (width, height), dlss_frame) {
+            None if self.dlss.is_some() => match {
+                let upscaling = Instant::now();
+                let eyes = self.dlss_eyes(&context, &image, (width, height), dlss_frame);
+                PAIRS.time(Stage::GlUpscale, upscaling.elapsed());
+                eyes
+            } {
                 Some(eyes) => eyes.map(|eye| (eye, whole)),
                 None => return,
             },
@@ -518,6 +523,10 @@ impl State {
             );
             if let Some(rate) = PAIRS.settings().and_then(|s| s.rate) {
                 rate();
+            }
+            let timing = PAIRS.timing_report();
+            if !timing.is_empty() {
+                log!("{timing}");
             }
             self.window_start = Some(Instant::now());
             self.window_pairs = 0;

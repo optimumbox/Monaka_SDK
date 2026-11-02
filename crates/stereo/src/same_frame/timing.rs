@@ -23,7 +23,7 @@ pub enum Stage {
     /// OpenGL: the frame copied out at `SwapBuffers` (with frame warping the eye and its depth;
     /// the interop lock included).
     GlColour,
-    /// OpenGL: the eye upscaled (FSR; the warp thread).
+    /// OpenGL: the eyes upscaled (FSR on the warp thread; DLSS's commands on the render thread).
     GlUpscale,
     /// OpenGL: the frame captured for the warp, the pair warped and published (the warp thread).
     GlWarp,
@@ -64,7 +64,7 @@ impl Stage {
             Stage::RightDrain => "right drain",
             Stage::FrameInterval => "frame interval",
             Stage::GlColour => "GL copy out",
-            Stage::GlUpscale => "FSR",
+            Stage::GlUpscale => "upscale",
             Stage::GlWarp => "warp and publish",
             Stage::GlPresent => "Monaka at SwapBuffers",
             Stage::GameSwap => "game's SwapBuffers",
@@ -81,18 +81,22 @@ static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 pub struct Timings {
     nanos: [AtomicU64; Stage::ALL.len()],
     counts: [AtomicU64; Stage::ALL.len()],
+    /// Each stage's longest time since the last report.
+    maxes: [AtomicU64; Stage::ALL.len()],
     /// When the last pair finished (nanoseconds on the run's clock; 0: none yet).
     last_pair: AtomicU64,
 }
 
 impl Timings {
     pub const fn new() -> Self {
-        Self { nanos: [const { AtomicU64::new(0) }; Stage::ALL.len()], counts: [const { AtomicU64::new(0) }; Stage::ALL.len()], last_pair: AtomicU64::new(0) }
+        Self { nanos: [const { AtomicU64::new(0) }; Stage::ALL.len()], counts: [const { AtomicU64::new(0) }; Stage::ALL.len()], maxes: [const { AtomicU64::new(0) }; Stage::ALL.len()], last_pair: AtomicU64::new(0) }
     }
 
     /// `stage` took `took`.
     pub fn time(&self, stage: Stage, took: Duration) {
-        self.nanos[stage as usize].fetch_add(took.as_nanos() as u64, Relaxed);
+        let nanos = took.as_nanos() as u64;
+        self.nanos[stage as usize].fetch_add(nanos, Relaxed);
+        self.maxes[stage as usize].fetch_max(nanos, Relaxed);
         self.counts[stage as usize].fetch_add(1, Relaxed);
     }
 
@@ -106,15 +110,16 @@ impl Timings {
         }
     }
 
-    /// The average of each stage timed since the last report (each started afresh):
-    /// `timing (average ms): left scene 4.20 (x600); ..`; empty when none was.
+    /// The average and longest of each stage timed since the last report (each started afresh):
+    /// `timing (average ms): left scene 4.20 (at most 6.10, x600); ..`; empty when none was.
     pub fn report(&self) -> String {
         let mut stages = String::new();
         for stage in Stage::ALL {
             let count = self.counts[stage as usize].swap(0, Relaxed);
             let nanos = self.nanos[stage as usize].swap(0, Relaxed);
+            let most = self.maxes[stage as usize].swap(0, Relaxed);
             if count > 0 {
-                stages += &format!(" {} {:.2} (x{count});", stage.name(), nanos as f64 / count as f64 / 1e6);
+                stages += &format!(" {} {:.2} (at most {:.2}, x{count});", stage.name(), nanos as f64 / count as f64 / 1e6, most as f64 / 1e6);
             }
         }
         if stages.is_empty() { stages } else { format!("timing (average ms):{stages}") }
