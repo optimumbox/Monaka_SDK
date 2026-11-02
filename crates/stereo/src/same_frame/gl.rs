@@ -333,6 +333,11 @@ impl State {
         }
         let Some((width, height)) = client_size(dc) else { return self.fail("no window size") };
         FRAME_SIZE.store(u64::from(width) << 32 | u64::from(height), Relaxed);
+        // The channel is made at the first frame's size: nothing goes out until the game may
+        // publish at this one (`crate::eye_size::ready`, while it is asked for the eye size).
+        if PAIRS.settings().is_some_and(|s| !(s.ready)(width, height)) {
+            return;
+        }
         let (eye_width, eye_height) = eye_size((width, height), self.side_by_side);
         if let Some(warp) = self.warp {
             return self.warped(frame, warp, (width, height));
