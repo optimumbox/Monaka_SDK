@@ -136,6 +136,8 @@ pub struct PairLoop<G: Game> {
     pub warp: fn(&Start<'_, G>) -> Option<gl::GlWarp>,
     /// OpenGL, both eyes side by side: each eye's depth with its pair for this run, or none.
     pub depth: fn(&Start<'_, G>) -> Option<gl::GlPairDepth>,
+    /// OpenGL, both eyes side by side: DLSS for this run (each eye drawn smaller, upscaled), or none.
+    pub dlss: fn(&Start<'_, G>) -> Option<gl::GlDlss>,
     /// The game presents each frame only once it has started drawing the next (its swap at the
     /// start of the next frame's drawing): the frame presented is the one before the frame drawing,
     /// whose ticket is already issued ([`monaka_core::ticket::Tickets::show_behind_drawing`]).
@@ -163,6 +165,7 @@ impl<G: Game> PairLoop<G> {
             paused: None,
             warp: |_| None,
             depth: |_| None,
+            dlss: |_| None,
             presents_behind_drawing: false,
         }
     }
@@ -257,7 +260,7 @@ fn install<G: PresentsPairs + EyeSite>(start: &mut Start<'_, G>) -> Result<(), L
         // SAFETY: called at start, before the hooks are enabled.
         Output::D3D11 => unsafe { d3d11::install(start.hooks, channel)? },
         Output::D3D12 => d3d12::install(channel),
-        Output::OpenGl { side_by_side } => gl::install(channel, side_by_side, (game.warp)(start), (game.depth)(start)),
+        Output::OpenGl { side_by_side } => gl::install(channel, side_by_side, (game.warp)(start), (game.depth)(start), (game.dlss)(start)),
         Output::SideBySide => side_by_side::install(channel),
     }
     (game.entry)(start)?;

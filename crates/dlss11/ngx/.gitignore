@@ -1,0 +1,4 @@
+# NVIDIA's files, from the DLSS SDK (github.com/NVIDIA/DLSS): not kept in git.
+nvsdk_ngx_s.lib
+nvsdk_ngx_d.lib
+nvngx_dlss.dll

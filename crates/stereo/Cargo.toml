@@ -13,6 +13,7 @@ monaka_channel.workspace = true
 monaka_ffx.workspace = true
 monaka_framegen.workspace = true
 monaka_fsr11.workspace = true
+monaka_dlss11.workspace = true
 monaka_gl.workspace = true
 monaka_hook.workspace = true
 monaka_producer.workspace = true

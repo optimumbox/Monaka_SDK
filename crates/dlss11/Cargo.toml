@@ -1,0 +1,25 @@
+[package]
+name = "monaka_dlss11"
+description = "NVIDIA DLSS upscaling for D3D11: motion vectors from depth and the eye cameras, each eye its own DLSS feature through NGX."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+monaka_channel.workspace = true
+monaka_warp.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]
+
+[lints]
+workspace = true

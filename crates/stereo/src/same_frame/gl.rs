@@ -16,6 +16,11 @@
 //! each warped pair's generated pair at once, the real pair half a frame later). All but the copy
 //! runs on a thread of its own ([`worker`]): the render thread is what holds such a game's frame
 //! rate.
+//!
+//! With DLSS ([`GlDlss`]) both eyes are still drawn each frame, side by side, but smaller (the
+//! render size) and with a jittered projection: each eye's half is upscaled to the eye size by its
+//! own DLSS feature (`monaka_dlss11`, motion from the scene depth and the eye's cameras) before it
+//! is published. A frame without its cameras (a menu, the game paused) is resampled instead.
 
 mod worker;
 
@@ -31,7 +36,8 @@ use monaka_channel::{ChannelName, d3d};
 use monaka_core::sync::Locked;
 use monaka_gl::Bridge;
 use monaka_producer::{log, wait_until};
-use monaka_warp::Scaler;
+use monaka_dlss11::{Dlss11, Quality};
+use monaka_warp::{EyeView, Scaler};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use std::time::Instant;
@@ -86,6 +92,32 @@ pub struct GlFsr {
     pub depth_flags: u32,
     /// Where AMD's DLLs are.
     pub dlls: &'static Path,
+}
+
+/// DLSS for an OpenGL game drawing both eyes side by side each frame at the render size.
+#[derive(Clone, Copy, Debug)]
+pub struct GlDlss {
+    pub quality: Quality,
+    /// The eye size each eye is upscaled to (the channel's).
+    pub display: (u32, u32),
+    /// The frame at this `SwapBuffers`: each eye's camera and unjittered projection and the jitter
+    /// both were drawn with, taken in step with the loop's tickets; none for a frame without them.
+    pub frame: fn() -> Option<GlDlssFrame>,
+    /// The game's scene depth now, behind the frame being presented (both eyes, as the colour).
+    pub depth: fn() -> Option<GlDepth>,
+    /// Where `nvngx_dlss.dll` is, and a folder NGX may write into.
+    pub dlls: &'static Path,
+    pub data: &'static Path,
+    /// 1 or -1: whether DLSS is told the content shift or its opposite.
+    pub jitter_sign: f32,
+}
+
+/// A frame's eyes as drawn for DLSS: each eye's camera (canonical, metres) and unjittered
+/// projection, and the jitter (render pixels, x right, y down) both projections were shifted by.
+#[derive(Clone, Copy, Debug)]
+pub struct GlDlssFrame {
+    pub views: [EyeView; 2],
+    pub jitter: [f32; 2],
 }
 
 /// The upscaled eye's size in a `width` x `height` frame for `display` (fractions).
@@ -155,6 +187,17 @@ struct State {
     warp: Option<GlWarp>,
     /// Each eye's depth with its pair ([`GlPairDepth`]).
     pair_depth: Option<GlPairDepth>,
+    /// DLSS: both eyes drawn smaller, each upscaled ([`GlDlss`]).
+    dlss: Option<GlDlss>,
+    upscaler: Option<Dlss11>,
+    dlss_broken: bool,
+    /// Each eye's last upscaled frame's time and camera position (its frame time, and a cut).
+    dlss_last: [Option<(Instant, [f32; 3])>; 2],
+    /// Resample each eye to the eye size (a frame DLSS did not upscale).
+    eye_scalers: [Option<Scaler>; 2],
+    upscaled: u64,
+    resampled: u64,
+    dlss_failures: u64,
     /// Pairs published with their depth, and the depth copies that failed.
     with_depth: u64,
     pair_depth_failures: u64,
@@ -190,7 +233,7 @@ unsafe impl Send for Cell {}
 
 static STATE: Mutex<Cell> = Mutex::new(Cell(None));
 
-pub(crate) fn install(channel: ChannelName, side_by_side: bool, warp: Option<GlWarp>, pair_depth: Option<GlPairDepth>) {
+pub(crate) fn install(channel: ChannelName, side_by_side: bool, warp: Option<GlWarp>, pair_depth: Option<GlPairDepth>, dlss: Option<GlDlss>) {
     if warp.is_some() {
         log!("frame warping: one eye per frame, the other warped from it with its depth");
     }
@@ -198,10 +241,22 @@ pub(crate) fn install(channel: ChannelName, side_by_side: bool, warp: Option<GlW
     if pair_depth.is_some() {
         log!("each eye's depth goes to the headset with its pair");
     }
+    let dlss = dlss.filter(|_| side_by_side && warp.is_none());
+    if let Some(dlss) = dlss {
+        log!("DLSS {}: each eye drawn smaller, upscaled to {}x{}", dlss.quality.name(), dlss.display.0, dlss.display.1);
+    }
     let state = State {
         side_by_side,
         warp,
         pair_depth,
+        dlss,
+        upscaler: None,
+        dlss_broken: false,
+        dlss_last: [None, None],
+        eye_scalers: [None, None],
+        upscaled: 0,
+        resampled: 0,
+        dlss_failures: 0,
         with_depth: 0,
         pair_depth_failures: 0,
         channel: channel.clone(),
@@ -276,6 +331,10 @@ fn release_here() {
             bridge.release();
         }
         state.scaler = None;
+        state.eye_scalers = [None, None];
+        if state.upscaler.take().is_some() || state.dlss.is_some() {
+            log!("DLSS: {} frames upscaled, {} resampled, {} failed", state.upscaled, state.resampled, state.dlss_failures);
+        }
         state.context = None;
         let (pairs, flat_pairs) = (state.pairs + worker::PUBLISHED.load(Relaxed), state.flat_pairs + worker::PUBLISHED_FLAT.load(Relaxed));
         log!("capture released after {} frames, {pairs} pairs ({flat_pairs} flat), {} failures", frames(), state.failures);
@@ -342,6 +401,10 @@ impl State {
         if let Some(warp) = self.warp {
             return self.warped(frame, warp, (width, height));
         }
+        // With DLSS the eyes go out at the eye size it upscales to; the frame's cameras are taken
+        // each frame, in step with the tickets.
+        let dlss_frame = self.dlss.and_then(|d| (d.frame)());
+        let (out_width, out_height) = self.dlss.map_or((eye_width, eye_height), |d| d.display);
         let (Some(bridge), Some(context)) = (self.bridge.as_mut(), self.context.clone()) else { return };
         let device = bridge.device().clone();
         let copying = Instant::now();
@@ -361,7 +424,7 @@ impl State {
             self.flat = flat;
         }
         // Each eye: a texture and its region (each the eye size).
-        let whole = D3D11_BOX { left: 0, top: 0, front: 0, right: eye_width, bottom: eye_height, back: 1 };
+        let whole = D3D11_BOX { left: 0, top: 0, front: 0, right: out_width, bottom: out_height, back: 1 };
         let eyes: [(ID3D11Texture2D, D3D11_BOX); 2] = match flat {
             Some(_) => {
                 let scaler = match self.scaler.as_mut() {
@@ -371,11 +434,15 @@ impl State {
                         Err(e) => return self.fail(format!("flat frame scaler: {e}")),
                     },
                 };
-                match scaler.run(&context, &image, (eye_width, eye_height)) {
+                match scaler.run(&context, &image, (out_width, out_height)) {
                     Ok(scaled) => [(scaled.clone(), whole), (scaled.clone(), whole)],
                     Err(e) => return self.fail(format!("flat frame: {e}")),
                 }
             }
+            None if self.dlss.is_some() => match self.dlss_eyes(&context, &image, (width, height), dlss_frame) {
+                Some(eyes) => eyes.map(|eye| (eye, whole)),
+                None => return,
+            },
             None if self.side_by_side => [0, 1].map(|eye| {
                 let left = eye * eye_width;
                 (image.clone(), D3D11_BOX { left, right: left + eye_width, ..whole })
@@ -386,7 +453,7 @@ impl State {
         // The channel is made at the first frame's eye size; without it, or at another size (the
         // viewer keeps the size it opened), publishing stops.
         let format = d3d::texture_desc(&eyes[0].0).Format;
-        let Some(writer) = self.writer.get(&device, eye_width, eye_height, format).ready(|note| log!("{note} (frame {width}x{height})")) else {
+        let Some(writer) = self.writer.get(&device, out_width, out_height, format).ready(|note| log!("{note} (frame {width}x{height})")) else {
             self.broken = true;
             return;
         };
@@ -418,7 +485,7 @@ impl State {
             }
             _ => None,
         };
-        let Some(writer) = self.writer.get(&device, eye_width, eye_height, format).ready(|_| {}) else { return };
+        let Some(writer) = self.writer.get(&device, out_width, out_height, format).ready(|_| {}) else { return };
         let depth = depth.as_ref().map(|(texture, near)| monaka_channel::fence11::Depth {
             eyes: [0, 1].map(|eye| monaka_channel::fence11::EyeDepth { texture, rect: Some([eye * eye_width, 0, eye_width, eye_height]) }),
             params: monaka_contract::protocol::DepthParams::new(*near, f32::INFINITY, false),
@@ -453,6 +520,100 @@ impl State {
             self.window_start = Some(Instant::now());
             self.window_pairs = 0;
         }
+    }
+}
+
+impl State {
+    /// Both eyes of a DLSS frame (`image`, the whole frame `size`) at the eye size: upscaled when the
+    /// frame has its cameras (`drawn`) and DLSS runs, else resampled; none when neither worked.
+    fn dlss_eyes(&mut self, context: &ID3D11DeviceContext, image: &ID3D11Texture2D, size: (u32, u32), drawn: Option<GlDlssFrame>) -> Option<[ID3D11Texture2D; 2]> {
+        let dlss = self.dlss?;
+        if let Some(eyes) = drawn.and_then(|drawn| self.upscaled(dlss, context, image, size, drawn)) {
+            self.upscaled += 1;
+            return Some(eyes);
+        }
+        self.resampled += 1;
+        let device = self.bridge.as_ref()?.device().clone();
+        let display = dlss.display;
+        let mut eyes = Vec::with_capacity(2);
+        for (eye, scaler) in self.eye_scalers.iter_mut().enumerate() {
+            if scaler.is_none() {
+                *scaler = Scaler::new(&device).ok();
+            }
+            // The whole frame stretched over two eyes' width, this eye's half in view.
+            let rect = [-(eye as f32) * display.0 as f32, 0.0, 2.0 * display.0 as f32, display.1 as f32];
+            eyes.push(scaler.as_mut()?.run_into(context, image, display, rect).ok()?.clone());
+        }
+        eyes.try_into().ok()
+    }
+
+    /// Both eyes of `image` upscaled by DLSS with the scene depth and the frame's cameras; none when
+    /// DLSS is unavailable or failed this frame.
+    fn upscaled(&mut self, dlss: GlDlss, context: &ID3D11DeviceContext, image: &ID3D11Texture2D, (width, height): (u32, u32), drawn: GlDlssFrame) -> Option<[ID3D11Texture2D; 2]> {
+        if self.dlss_broken {
+            return None;
+        }
+        let render = (width / 2, height);
+        let bridge = self.bridge.as_mut()?;
+        let device = bridge.device().clone();
+        let depth = (dlss.depth)().ok_or("no scene depth".to_owned()).and_then(|d| {
+            bridge.capture_depth(d.texture, (d.width, d.height), d.multisampled, [0.0, 0.0, 1.0, 1.0], width, height).map(|t| t.clone()).map_err(|e| e.to_string())
+        });
+        let depth = match depth {
+            Ok(depth) => depth,
+            Err(e) => {
+                if self.dlss_failures < 5 {
+                    log!("DLSS: {e}; the eyes are resampled");
+                }
+                self.dlss_failures += 1;
+                return None;
+            }
+        };
+        if self.upscaler.as_ref().is_none_or(|made| made.render() != render || made.display() != dlss.display) {
+            self.upscaler = None;
+            let settings = monaka_dlss11::Settings {
+                render,
+                display: dlss.display,
+                quality: dlss.quality,
+                data_dir: dlss.data.to_path_buf(),
+                dll_dirs: vec![dlss.dlls.to_path_buf()],
+                jitter_sign: dlss.jitter_sign,
+            };
+            match Dlss11::new(&device, context, settings) {
+                Ok(made) => {
+                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye", dlss.quality.name(), render.0, render.1, dlss.display.0, dlss.display.1);
+                    self.upscaler = Some(made);
+                    self.dlss_last = [None, None];
+                }
+                Err(e) => {
+                    log!("{e}; the eyes are resampled instead");
+                    self.dlss_broken = true;
+                    return None;
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut eyes = Vec::with_capacity(2);
+        for eye in 0..2 {
+            let view = drawn.views[eye];
+            let position = [view.camera[3], view.camera[7], view.camera[11]];
+            let (frame_time_ms, cut) = crate::upscaler::fsr11::frame_time_and_cut(self.dlss_last[eye], now, position);
+            self.dlss_last[eye] = Some((now, position));
+            let left = eye as u32 * render.0;
+            let part = D3D11_BOX { left, top: 0, front: 0, right: left + render.0, bottom: render.1, back: 1 };
+            let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut };
+            match self.upscaler.as_mut()?.upscale(context, eye, &frame) {
+                Ok(out) => eyes.push(out),
+                Err(e) => {
+                    if self.dlss_failures < 5 {
+                        log!("{e}");
+                    }
+                    self.dlss_failures += 1;
+                    return None;
+                }
+            }
+        }
+        eyes.try_into().ok()
     }
 }
 
