@@ -313,9 +313,13 @@ pub fn present(dc: HDC) {
     if PAIRS.publishing() {
         ACTIVE.store(true, Release);
         let started = Instant::now();
+        let mut gpu = GPU.locked();
+        gpu.start();
         if let Some(state) = STATE.locked().0.as_mut() {
             state.frame(dc);
         }
+        gpu.end();
+        drop(gpu);
         PAIRS.time(Stage::GlPresent, started.elapsed());
     } else if ACTIVE.load(Acquire) {
         release_here();
@@ -341,8 +345,107 @@ pub(crate) fn release() {
     }
 }
 
+/// The GPU's own times around each swap ([`monaka_gl::GpuClock`]), summed over [`GPU_EVERY`].
+struct GpuTally {
+    clock: Option<std::result::Result<monaka_gl::GpuClock, ()>>,
+    since: Option<Instant>,
+    frames: u32,
+    game_frames: u32,
+    game_sum: f64,
+    game_max: f64,
+    over: u32,
+    ours_sum: f64,
+    ours_max: f64,
+    behind_sum: f64,
+    behind_max: f64,
+}
+
+/// How often the GPU's times are said.
+const GPU_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+/// A game frame longer than this on the GPU (ms) misses a 90 Hz refresh.
+const GPU_OVER_MS: f64 = 11.1;
+
+struct GpuCell(GpuTally);
+// SAFETY: the clock's GL queries are only used on the render thread, inside `SwapBuffers`.
+unsafe impl Send for GpuCell {}
+
+impl std::ops::Deref for GpuCell {
+    type Target = GpuTally;
+    fn deref(&self) -> &GpuTally {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GpuCell {
+    fn deref_mut(&mut self) -> &mut GpuTally {
+        &mut self.0
+    }
+}
+
+static GPU: Mutex<GpuCell> = Mutex::new(GpuCell(GpuTally {
+    clock: None,
+    since: None,
+    frames: 0,
+    game_frames: 0,
+    game_sum: 0.0,
+    game_max: 0.0,
+    over: 0,
+    ours_sum: 0.0,
+    ours_max: 0.0,
+    behind_sum: 0.0,
+    behind_max: 0.0,
+}));
+
+impl GpuTally {
+    fn start(&mut self) {
+        let clock = self.clock.get_or_insert_with(|| monaka_gl::GpuClock::new().map_err(|e| log!("GPU times: {e}; not measured this run")));
+        let Ok(clock) = clock.as_mut() else { return };
+        let mut frames = Vec::new();
+        clock.start(|frame| frames.push(frame));
+        for frame in frames {
+            self.frames += 1;
+            if let Some(game) = frame.game {
+                self.game_frames += 1;
+                self.game_sum += game;
+                self.game_max = self.game_max.max(game);
+                self.over += u32::from(game > GPU_OVER_MS);
+            }
+            self.ours_sum += frame.ours;
+            self.ours_max = self.ours_max.max(frame.ours);
+            self.behind_sum += frame.behind;
+            self.behind_max = self.behind_max.max(frame.behind);
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= GPU_EVERY && self.frames > 0 {
+            let n = f64::from(self.frames);
+            log!(
+                "GPU times (ms): the game's frame {:.2} on average, at most {:.2}, {} of {} over a 90 Hz refresh; Monaka at the swap {:.2}, at most {:.2}; the GPU {:.2} behind the CPU, at most {:.2}",
+                self.game_sum / f64::from(self.game_frames.max(1)),
+                self.game_max,
+                self.over,
+                self.game_frames,
+                self.ours_sum / n,
+                self.ours_max,
+                self.behind_sum / n,
+                self.behind_max
+            );
+            let clock = self.clock.take();
+            *self = GpuTally { clock, since: Some(Instant::now()), frames: 0, game_frames: 0, game_sum: 0.0, game_max: 0.0, over: 0, ours_sum: 0.0, ours_max: 0.0, behind_sum: 0.0, behind_max: 0.0 };
+        }
+    }
+
+    fn end(&mut self) {
+        if let Some(Ok(clock)) = self.clock.as_mut() {
+            clock.end();
+        }
+    }
+}
+
 /// Frees the GL objects; called on the render thread with the game's context current.
 fn release_here() {
+    if let Some(Ok(clock)) = GPU.locked().clock.take() {
+        clock.release();
+    }
     if let Some(state) = STATE.locked().0.as_mut() {
         // The warp thread finishes first: the bridge's textures are what it reads.
         if let Some(mut worker) = state.worker.take() {

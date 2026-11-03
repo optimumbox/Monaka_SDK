@@ -14,8 +14,10 @@
 //! bindings, read buffer, scissor test, sRGB writes) is saved and put back.
 
 mod depth;
+mod gpu_clock;
 
 pub use depth::texel_rect;
+pub use gpu_clock::{GpuClock, GpuFrame};
 use depth::DepthPass;
 use monaka_channel::d3d;
 use std::ffi::c_void;
