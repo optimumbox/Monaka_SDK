@@ -284,7 +284,7 @@ impl Warping {
         let shot = job.shot.filter(|_| job.flat.is_none());
         if let (Some(GlShot { shot, jitter }), Some(depth)) = (shot, job.depth.as_ref()) {
             let posed = WARPED.load(Relaxed);
-            if posed + 1 == DESCRIBED_AT || posed == DESCRIBED_AT {
+            if self.warp.snapshots > 0 && (posed + 1 == DESCRIBED_AT || posed == DESCRIBED_AT) {
                 describe_warp(&device, &context, depth, &job.image, &shot);
             }
             match self.warp.fsr {
