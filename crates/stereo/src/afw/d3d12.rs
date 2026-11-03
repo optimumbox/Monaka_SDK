@@ -183,6 +183,7 @@ impl Afw12 {
     pub fn new(device: &ID3D12Device, slots: usize, rules: Rules) -> Result<Self, String> {
         let mut reprojector = Reprojector12::new(device).map_err(|e| e.to_string())?;
         reprojector.fill_first = rules.fill_first;
+        reprojector.held_reach = f32::from(rules.held_reach_cm) / 100.0;
         Ok(Self {
             device: device.clone(),
             recorder: Recorder::new(device, 4).map_err(|e| format!("command lists: {e}"))?,

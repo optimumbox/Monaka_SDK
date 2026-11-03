@@ -181,15 +181,18 @@ pub struct Rules {
     /// the eye last rendered it, not as the other eye saw it, so a real frame and a warped one
     /// alternate without a blink. Without, the warp is used wherever it has pixels.
     pub fill_first: bool,
+    /// Centimetres from the eye within which the eye's own last frame never fills (0: none): the
+    /// hands and what they hold, which it shows where they were (`monaka_warp::Reprojector::held_reach`).
+    pub held_reach_cm: u16,
 }
 
 impl Rules {
     /// Every rule: an old frame (from before a pause or a cut) fills nothing, menus go flat, a
     /// frame not warped still goes out, the eye's own frame first.
-    pub const WHOLE: Self = Self { fill_age: Some(4), flat_frames: true, plain_pairs: true, fill_first: true };
+    pub const WHOLE: Self = Self { fill_age: Some(4), flat_frames: true, plain_pairs: true, fill_first: true, held_reach_cm: 0 };
     /// Warped pairs only: the other eye's newest frame fills whatever its age, and a frame not
     /// warped (a menu, a loading screen, no depth) publishes nothing.
-    pub const WARPED_ONLY: Self = Self { fill_age: None, flat_frames: false, plain_pairs: false, fill_first: false };
+    pub const WARPED_ONLY: Self = Self { fill_age: None, flat_frames: false, plain_pairs: false, fill_first: false, held_reach_cm: 0 };
 
     /// These rules on a schedule that renders one eye `refresh` presents in a row: that eye's frames
     /// fill the other eye's gaps for that long.
@@ -205,6 +208,11 @@ impl Rules {
     /// These rules with the eye's own frame first, or not.
     pub const fn fill_first(self, on: bool) -> Self {
         Self { fill_first: on, ..self }
+    }
+
+    /// These rules with the eye's own frame never filling within `cm` centimetres of the eye.
+    pub const fn held_reach(self, cm: u16) -> Self {
+        Self { held_reach_cm: cm, ..self }
     }
 }
 

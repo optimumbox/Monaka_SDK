@@ -98,7 +98,7 @@ fn compute_shader(device: &ID3D11Device, source: &str, name: &str, entry: PCSTR)
 }
 
 /// A constant buffer holding one `T`, laid out as its HLSL `cbuffer`, written whole and bound at
-/// b0 of the compute stage.
+/// a slot of the compute stage (b0, or [`ConstantBuffer::bind_at`]).
 struct ConstantBuffer<T: Copy> {
     buffer: ID3D11Buffer,
     layout: PhantomData<T>,
@@ -126,8 +126,12 @@ impl<T: Copy> ConstantBuffer<T> {
     }
 
     fn bind(&self, context: &ID3D11DeviceContext) {
+        self.bind_at(context, 0);
+    }
+
+    fn bind_at(&self, context: &ID3D11DeviceContext, slot: u32) {
         // SAFETY: binds our own buffer; callers restore the game's bindings after.
-        unsafe { context.CSSetConstantBuffers(0, Some(&[Some(self.buffer.clone())])) };
+        unsafe { context.CSSetConstantBuffers(slot, Some(&[Some(self.buffer.clone())])) };
     }
 }
 
@@ -217,7 +221,7 @@ struct SavedCompute {
     shader: Option<ID3D11ComputeShader>,
     resources: [Option<ID3D11ShaderResourceView>; 6],
     uavs: [Option<ID3D11UnorderedAccessView>; 3],
-    constants: [Option<ID3D11Buffer>; 1],
+    constants: [Option<ID3D11Buffer>; 2],
 }
 
 impl SavedCompute {

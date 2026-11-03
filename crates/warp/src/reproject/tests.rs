@@ -127,6 +127,90 @@ fn a_gap_beside_something_near_shows_what_is_behind_it_not_a_near_fill() {
 }
 
 #[test]
+fn a_gap_within_the_hands_reach_never_takes_the_eyes_own_frame() {
+    // The box 0.5 m away in front of the wall 2 m away, as above; the eye's own last frame shows
+    // something 0.8 m away there (green): the real eye could not see it behind the box, so it fills
+    // the gap. Within the hands' reach (0.9 m) that is a held gun where it was a frame ago: the gap
+    // shows the wall behind it instead (alpha 85).
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (64u32, 8u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let (box_columns, wall, near) = (24..36u32, [255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+    let depth: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| at(if box_columns.contains(&x) { 0.5 } else { 2.0 }).to_le_bytes())).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth);
+    let colours: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| if box_columns.contains(&x) { near } else { wall })).collect();
+    let this = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &colours);
+    let held_depth: Vec<u8> = (0..w * h).flat_map(|_| at(0.8).to_le_bytes()).collect();
+    let held_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &held_depth);
+    let green: Vec<u8> = (0..w * h).flat_map(|_| [0, 255, 0, 255]).collect();
+    let last = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &green);
+    let camera = |x: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] };
+    let primary = reprojector.capture(&context, &this, &depth, projection, camera(0.0), None).unwrap();
+    let fill = reprojector.capture(&context, &last, &held_depth, projection, camera(0.1), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(0.1), mapping, width: w, height: h };
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    for x in 30..32 {
+        assert_eq!(read_pixel(&device, &context, &image, x, 3).unwrap(), [0, 255, 0, 170], "column {x}: without a reach, the fill");
+    }
+    reprojector.held_reach = 0.9;
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    for x in 30..33 {
+        assert_eq!(read_pixel(&device, &context, &image, x, 3).unwrap(), [wall[0], wall[1], wall[2], 85], "column {x}: the wall behind, not the held thing");
+    }
+    // Past the reach (a bar 1 m away, as above), the fill as before.
+    let bar_depth: Vec<u8> = (0..w * h).flat_map(|_| at(1.0).to_le_bytes()).collect();
+    let bar_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &bar_depth);
+    let fill = reprojector.capture(&context, &last, &bar_depth, projection, camera(0.1), None).unwrap();
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    assert_eq!(read_pixel(&device, &context, &image, 31, 3).unwrap(), [0, 255, 0, 170], "the bar past the reach, from the fill");
+}
+
+#[test]
+fn held_things_in_the_eyes_own_frame_move_with_the_play_space() {
+    // As above, the eye's own last frame showing something 0.8 m away (green) everywhere, but drawn
+    // 0.1 m to the left of where the eye is now: the stick moved the player since. In the world the
+    // green thing would have moved 0.1 m against the eye; held, it moved with it. With the held
+    // camera (where the last frame's camera would be in today's play space, here the eye itself),
+    // it lands where it was in that frame and fills the gap beside the box.
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (64u32, 8u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let (box_columns, wall, near) = (24..36u32, [255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+    let depth: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| at(if box_columns.contains(&x) { 0.5 } else { 2.0 }).to_le_bytes())).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth);
+    let colours: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| if box_columns.contains(&x) { near } else { wall })).collect();
+    let this = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &colours);
+    let held_depth: Vec<u8> = (0..w * h).flat_map(|_| at(0.8).to_le_bytes()).collect();
+    let held_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &held_depth);
+    let green: Vec<u8> = (0..w * h).flat_map(|_| [0, 255, 0, 255]).collect();
+    let last = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &green);
+    let camera = |x: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] };
+    let primary = reprojector.capture(&context, &this, &depth, projection, camera(0.0), None).unwrap();
+    let fill = reprojector.capture(&context, &last, &held_depth, projection, camera(0.0), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(0.1), mapping, width: w, height: h };
+    reprojector.held_reach = 0.9;
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    for x in 30..33 {
+        assert_eq!(read_pixel(&device, &context, &image, x, 3).unwrap(), [wall[0], wall[1], wall[2], 85], "column {x}: without the held camera, the wall behind");
+    }
+    reprojector.fill_held_camera = Some(camera(0.1));
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    for x in 30..32 {
+        assert_eq!(read_pixel(&device, &context, &image, x, 3).unwrap(), [0, 255, 0, 170], "column {x}: the held thing, moved with the play space");
+    }
+}
+
+#[test]
 fn a_hole_the_real_eye_could_not_see_in_a_surface_comes_from_the_eyes_own_frame() {
     // A bar 1 m away in front of a wall 4 m away; in the real eye something 0.25 m away hides the
     // bar's middle rows, but not the wall just left of it. The other eye 0.25 m to the right sees
@@ -236,6 +320,49 @@ fn what_a_large_near_thing_hid_comes_from_the_eyes_own_frame_and_what_moved_does
         assert_eq!(pixel(50, y), [0, 255, 0, 170], "row {y}: the bar behind the large near thing");
     }
     assert_eq!(pixel(22, 122), [255, 0, 0, 255], "the wall: the own frame's blob has moved");
+}
+
+#[test]
+fn a_hole_in_a_near_thing_that_moved_shows_the_thing_not_what_was_behind_it() {
+    // A held gun 0.5 m away fills the real eye; the other eye is 0.375 m nearer, so the gun is drawn
+    // four times its size, landed pixels 4 apart: holes in it too wide to be cracks. That eye's own
+    // last frame shows the wall 2 m away everywhere (the gun was elsewhere then): the holes keep the
+    // gun's colour, not the wall seen through it. Where that frame showed the gun too, its own frame
+    // (alpha 170).
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (64u32, 64u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let (gun, wall, own_gun) = ([0u8, 0, 255, 255], [255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+    let images = |colour: [u8; 4], distance: f32| {
+        let colours: Vec<u8> = (0..w * h).flat_map(|_| colour).collect();
+        let depth: Vec<u8> = (0..w * h).flat_map(|_| at(distance).to_le_bytes()).collect();
+        (texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &colours), texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth))
+    };
+    let camera = |z: f32| -> Mat34 { [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, z] };
+    let (gun_colour, gun_depth) = images(gun, 0.5);
+    let primary = reprojector.capture(&context, &gun_colour, &gun_depth, projection, camera(0.0), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(-0.375), mapping, width: w, height: h };
+    let (wall_colour, wall_depth) = images(wall, 1.625);
+    let fill = reprojector.capture(&context, &wall_colour, &wall_depth, projection, camera(-0.375), None).unwrap();
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    let (_, _, pixels) = read_image(&device, &context, &image).unwrap();
+    for y in 8..h - 8 {
+        for x in 8..w - 8 {
+            let pixel = &pixels[((y * w + x) * 4) as usize..][..4];
+            assert!(pixel[..3] == gun[..3], "pixel {x}, {y}: {pixel:?}, the wall through the gun");
+        }
+    }
+    let (own_colour, own_depth) = images(own_gun, 0.125);
+    let fill = reprojector.capture(&context, &own_colour, &own_depth, projection, camera(-0.375), None).unwrap();
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    let (_, _, pixels) = read_image(&device, &context, &image).unwrap();
+    let own = (8..h - 8).flat_map(|y| (8..w - 8).map(move |x| (x, y))).filter(|&(x, y)| pixels[((y * w + x) * 4) as usize..][..4] == [0, 255, 0, 170]).count();
+    assert!(own > 0, "the own frame's gun nowhere in the holes");
 }
 
 #[test]

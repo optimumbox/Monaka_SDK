@@ -19,7 +19,10 @@
 // Resolve takes the primary, or the fill where the fill is nearer and hidden from the primary's eye
 // (what that eye saw beside a surface it could not see slid into the surface's place: the far wall
 // seen through a bar where an arrow hid the bar), then the primary's own surface across a crack in
-// it (Crack), then the fill where the primary left a gap unless the fill's point was seen past, then
+// it (Crack), then the primary's surface across a hole in a near thing drawn much larger, where the
+// fill only knows what was behind it before it moved there (Hole: a held gun swung, which the fill
+// would show the wall through), then the fill where the primary left a gap unless the fill's point
+// was seen past, then
 // the surface behind the gap, the farther of its horizontal neighbours (Behind). With FillFirst, a
 // pixel where the fill shows the same surface as the primary (their
 // nearness agrees) takes the fill: this eye's own last real frame, as the eye rendered it, so a real
@@ -40,7 +43,23 @@ cbuffer Reproject : register(b0) {
     uint Sources;         // a debug view instead of the image (see Shown)
     row_major float4x4 Back;  // resolves: the target's clip -> the primary's (Seen)
     uint4 PrimaryDepth;       // resolves: the primary's depth area in Depth (origin, size; size 0: none)
+    float HeldNearness;       // resolves: the fill is never taken nearer than this (0: none; see Held)
+    uint3 Pad;
 };
+#ifdef HELD_MOTION
+// The fill's held pixels (nearer than HeldNearness) land by MHeld, from where its camera would have
+// been had the play space then been where it is now (the hands move with it, not the world):
+// HeldMoves in the fill's splats, HeldTrusted in the resolves (see Held).
+cbuffer HeldMotion : register(b1) {
+    row_major float4x4 MHeld;
+    uint HeldMoves;
+    uint HeldTrusted;
+    uint2 HeldPad;
+};
+#else
+static const uint HeldMoves = 0;
+static const uint HeldTrusted = 0;
+#endif
 Texture2D<float4> Color : register(t0);
 Texture2D<float> Depth : register(t1);
 Texture2D<float4> Primary : register(t2);
@@ -84,6 +103,9 @@ bool Land(uint2 p, out uint2 target, out uint key) {
     float d = NearestDepth(at);
     float2 ndc = float2((p.x + 0.5) / SW * 2 - 1, 1 - (p.y + 0.5) / SH * 2);
     float4 clip = mul(M, float4(ndc, d, 1));
+#ifdef HELD_MOTION
+    if (HeldMoves && HeldNearness > 0 && NearA * d + NearB > HeldNearness) clip = mul(MHeld, float4(ndc, d, 1));
+#endif
     if (!(clip.w > 0)) return false;
     float3 t = clip.xyz / clip.w;
     float2 pixel = float2((t.x + 1) * 0.5 * W, (1 - t.y) * 0.5 * H);
@@ -177,6 +199,55 @@ int2 Crack(uint2 p) {
     return best;
 }
 
+// How far a hole (below) is looked across, each way.
+static const int HOLE_REACH = 8;
+
+// The nearest pixel of `keys` within HOLE_REACH of `p` at nearness `near` or nearer (less a fifth):
+// whether that image shows something about as near as `near` around `p`.
+bool NearAround(Texture2D<uint> keys, uint2 p, uint near) {
+    [loop] for (int y = -HOLE_REACH; y <= HOLE_REACH; y += 2) {
+        [loop] for (int x = -HOLE_REACH; x <= HOLE_REACH; x += 2) {
+            int2 q = int2(p) + int2(x, y);
+            if (Inside(q) && Nearness(keys.Load(int3(q, 0))) >= near - near / 5) return true;
+        }
+    }
+    return false;
+}
+
+// A hole: a gap at target pixel `p` with primary pixels all round it within HOLE_REACH (in each of
+// the four quadrants about it), a near surface drawn so much larger than in its source (a held gun
+// close to the eyes) that its landed pixels are too far apart for a crack, where the fill (key
+// `fill`) shows something clearly behind all of them and nothing as near anywhere around: what that
+// frame saw before the near thing moved there, which would show through it. Of the quadrants'
+// closest pixels, the farthest (the surface behind the gap, should it lie between near things);
+// (-1, -1) for none, and its key in `key`.
+int2 Hole(uint2 p, uint fill, out uint key) {
+    key = 0;
+    if (!fill) return int2(-1, -1);
+    int2 closest[4] = { int2(-1, -1), int2(-1, -1), int2(-1, -1), int2(-1, -1) };
+    int reach[4] = { 1 << 30, 1 << 30, 1 << 30, 1 << 30 };
+    uint keys[4] = { 0, 0, 0, 0 };
+    [loop] for (int y = -HOLE_REACH; y <= HOLE_REACH; ++y) {
+        [loop] for (int x = -HOLE_REACH; x <= HOLE_REACH; ++x) {
+            int2 q = int2(p) + int2(x, y);
+            if ((x == 0 && y == 0) || !Inside(q)) continue;
+            uint k = PrimaryKeys.Load(int3(q, 0));
+            if (!k) continue;
+            // Quadrants turning about p, each with one half-axis.
+            uint quadrant = x > 0 && y >= 0 ? 0 : x <= 0 && y > 0 ? 1 : x < 0 && y <= 0 ? 2 : 3;
+            int d = x * x + y * y;
+            if (d < reach[quadrant]) { reach[quadrant] = d; closest[quadrant] = q; keys[quadrant] = k; }
+        }
+    }
+    uint farthest = 0xffffffff; int2 best = int2(-1, -1);
+    [unroll] for (int i = 0; i < 4; ++i) {
+        if (!keys[i]) return int2(-1, -1);
+        if (Nearness(keys[i]) < farthest) { farthest = Nearness(keys[i]); best = closest[i]; key = keys[i]; }
+    }
+    if (Nearness(fill) + farthest / 8 >= farthest || NearAround(FillKeys, p, farthest)) { key = 0; return int2(-1, -1); }
+    return best;
+}
+
 // What a pixel shows, its colour `color` and key `key` taken from `from` (0 the primary, 1 the fill,
 // 2 a neighbour of the primary's, 3 nothing). Sources 1 tints it by where it came from: the primary
 // as it is, the fill green, a neighbour solid blue (no game colour matches it exactly), nothing
@@ -193,10 +264,18 @@ float4 Shown(float4 color, uint key, uint from) {
     return float4(color.rgb, source);
 }
 
+// Whether the fill's pixel `fill` is within the hands' reach (HeldNearness) and not to be taken: the
+// hands and what they hold move with the play space and not with the world, so unless they landed
+// by its motion (HeldTrusted) the eye's own last frame shows them where they were. A gap there then
+// shows what is behind it instead.
+bool Held(uint fill) {
+    return !HeldTrusted && HeldNearness > 0 && Nearness(fill) / NEARNESS_STEPS > HeldNearness;
+}
+
 // Whether the fill's pixel at `p` (key `fill`) goes out over the primary's (key `primary`): the
 // same surface with FillFirst, or a clearly nearer one the primary's eye could not see (hidden).
 bool FillOver(uint2 p, uint fill, uint primary) {
-    if (!fill) return false;
+    if (!fill || Held(fill)) return false;
     if (FillFirst && SameSurface(fill, primary)) return true;
     uint nf = Nearness(fill), np = Nearness(primary);
     return np + nf / 8 < nf && Seen(p, fill) == HIDDEN;
@@ -205,7 +284,7 @@ bool FillOver(uint2 p, uint fill, uint primary) {
 // Whether the fill's pixel at `p` (key `fill`) fills the gap there: anything but a point the
 // primary's eye saw past (gone since).
 bool FillsGap(uint2 p, uint fill) {
-    return fill && Seen(p, fill) != PAST;
+    return fill && !Held(fill) && Seen(p, fill) != PAST;
 }
 
 [numthreads(8, 8, 1)] void Resolve(uint3 id : SV_DispatchThreadID) {
@@ -227,6 +306,8 @@ bool FillsGap(uint2 p, uint fill) {
     int2 crack = Crack(id.xy);
     if (crack.x >= 0) { Out[id.xy] = Shown(Primary.Load(int3(crack, 0)), PrimaryKeys.Load(int3(crack, 0)), 2); return; }
     uint fill = FillKeys.Load(int3(id.xy, 0));
+    uint hole_key; int2 hole = Hole(id.xy, fill, hole_key);
+    if (hole.x >= 0) { Out[id.xy] = Shown(Primary.Load(int3(hole, 0)), hole_key, 2); return; }
     if (FillsGap(id.xy, fill)) { Out[id.xy] = Shown(Fill.Load(int3(id.xy, 0)), fill, 1); return; }
     uint behind; int column = Behind(id.xy, behind);
     Out[id.xy] = column >= 0 ? Shown(Primary.Load(int3(column, id.y, 0)), behind, 2) : Shown(float4(0, 0, 0, 1), 0, 3);
@@ -241,6 +322,10 @@ bool FillsGap(uint2 p, uint fill) {
     if (!key) {
         int2 crack = Crack(p);
         if (crack.x >= 0) key = PrimaryKeys.Load(int3(crack, 0));
+    }
+    if (!key) {
+        uint hole_key; int2 hole = Hole(p, fill, hole_key);
+        if (hole.x >= 0) key = hole_key;
     }
     if (!key) {
         uint behind; int column = Behind(p, behind);

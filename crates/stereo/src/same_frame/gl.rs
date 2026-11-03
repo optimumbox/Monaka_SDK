@@ -56,6 +56,10 @@ pub struct GlWarp {
     pub shot: fn() -> Option<GlShot>,
     /// The game's scene depth now, behind the frame being presented.
     pub depth: fn() -> Option<GlDepth>,
+    /// Whether the frame being presented, one without a shot, was drawn with both eyes side by side
+    /// (the game's own stereo layout, which it keeps for its menus): its halves go out as the pair,
+    /// not warped. Otherwise such a frame is the one eye's part to both eyes.
+    pub side_by_side: fn() -> bool,
     /// Where the eye is in the frame (x, y from the top-left, width, height: fractions). The depth
     /// texture is taken over the same part when it covers the whole frame, else whole (an engine
     /// that renders each view into a target of the view's size: [`depth_region`]).
@@ -65,6 +69,8 @@ pub struct GlWarp {
     /// A debug view in the warped eye instead of its image (`monaka_warp::Reprojector::sources`:
     /// 0 none, 1 where each pixel came from, 2 its nearness).
     pub sources: u32,
+    /// Warped pairs written beside the log (`crate::afw::d3d11::Afw11::snapshots`; 0 none).
+    pub snapshots: u32,
     /// FSR: the eye drawn smaller (at `region`) and upscaled to the eye size before the warp.
     pub fsr: Option<GlFsr>,
     /// Frame generation: in-between pairs of the warped pairs (`crate::afw::d3d11::Afw11::frame_generation`).
@@ -90,8 +96,18 @@ pub struct GlFsr {
     pub jitter_sign: f32,
     /// The game's depth convention (`monaka_ffx::upscale::create` flags).
     pub depth_flags: u32,
-    /// Where AMD's DLLs are.
+    /// Where AMD's DLLs are (with `dlss`, where `nvngx_dlss.dll` is).
     pub dlls: &'static Path,
+    /// NVIDIA DLSS upscales the eye instead of FSR (its sharpening CAS, `jitter_sign` DLSS's).
+    pub dlss: Option<GlFsrDlss>,
+}
+
+/// DLSS in FSR's place for an OpenGL game drawing one eye per frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GlFsrDlss {
+    pub quality: Quality,
+    /// A folder NGX may write into.
+    pub data: &'static Path,
 }
 
 /// DLSS for an OpenGL game drawing both eyes side by side each frame at the render size.
@@ -664,16 +680,17 @@ impl State {
         let (_, waiting) = PAIRS.shown();
         self.waiting_max = self.waiting_max.max(waiting);
         let shot = (warp.shot)();
+        let halves = shot.is_none() && flat.is_none() && (warp.side_by_side)();
 
         let copying = Instant::now();
         let bridge = self.bridge.as_mut().expect("made at the first frame");
         let worker = self.worker.as_mut().expect("started above");
-        let (slot, image, depth) = match flat {
-            Some(_) => match bridge.capture(0, size.0, size.1) {
+        let (slot, image, depth) = match flat.is_some() || halves {
+            true => match bridge.capture(0, size.0, size.1) {
                 Ok(image) => (None, image.clone(), None),
                 Err(e) => return self.fail(format!("capture: {e}")),
             },
-            None => {
+            false => {
                 let Some(slot) = worker.slot() else { return };
                 let left = (size.0 as f32 * warp.region[0]).round() as u32;
                 let top = (size.1 as f32 * warp.region[1]).round() as u32;
@@ -715,7 +732,7 @@ impl State {
             }
         };
         PAIRS.time(Stage::GlColour, copying.elapsed());
-        worker.send(Job { frame, slot, image, depth, shot, flat, display, waiting_max: self.waiting_max, depth_failures: self.depth_failures });
+        worker.send(Job { frame, slot, image, depth, shot, flat, halves, display, waiting_max: self.waiting_max, depth_failures: self.depth_failures });
     }
 }
 

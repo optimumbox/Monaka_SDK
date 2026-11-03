@@ -19,7 +19,8 @@ use windows::core::s;
 mod tests;
 
 /// The shader on D3D11: its images written as UNORM (the views' own format, as D3D11 checks).
-pub const REPROJECT_SOURCE: &str = concat!("#define IMAGE unorm float4\n", include_str!("reproject.hlsl"));
+/// Held things in the fill move with the play space ([`Reprojector::fill_held_camera`], b1).
+pub const REPROJECT_SOURCE: &str = concat!("#define IMAGE unorm float4\n#define HELD_MOTION 1\n", include_str!("reproject.hlsl"));
 
 /// A frame's depth plane as R32 ([`Reprojector::plain_depth`]).
 const PLAIN_DEPTH: &str = r"
@@ -60,9 +61,36 @@ pub(crate) struct Constants {
     pub back: [f32; 16],
     /// Resolves: the primary's depth area (origin, size; size 0: none).
     pub primary_depth: [u32; 4],
+    /// The target nearness nearer than which the fill is never taken ([`held_nearness`]; 0: none).
+    pub held_nearness: f32,
+    pub pad: [u32; 3],
 }
 
-const _: () = assert!(size_of::<Constants>() == 52 * 4);
+const _: () = assert!(size_of::<Constants>() == 56 * 4);
+
+/// The layout of the HLSL `cbuffer HeldMotion` (D3D11 only, b1): how the fill's held pixels land
+/// ([`Reprojector::fill_held_camera`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HeldMotion {
+    /// The source frame's held pixels into the view: as `Constants::m`, from the held camera.
+    m: [f32; 16],
+    /// Splats: this source's held pixels land by `m` (the fill's, with a held camera).
+    moves: u32,
+    /// Resolves: the fill's held pixels are trusted (they landed by the play space's motion).
+    trusted: u32,
+    pad: [u32; 2],
+}
+
+/// The target nearness of a point `reach` metres in front of `view`'s eye (0 for no reach): nearer
+/// than it, the fill is never taken ([`Reprojector::held_reach`]).
+pub(crate) fn held_nearness(view: &View, reach: f32) -> f32 {
+    let p = &view.projection;
+    match reach > 0.0 && p[11] != 0.0 {
+        true => view.mapping.nearness(-p[10] + p[11] / reach),
+        false => 0.0,
+    }
+}
 
 /// The part of a depth texture that lines up with the image: left, top, width, height in texels
 /// (`None`: all of it), as `monaka_framegen::inputs::rect` gives it.
@@ -171,6 +199,18 @@ struct Layer {
 pub struct Reprojector {
     /// The fill first where its depth agrees with the primary's (`reproject.hlsl`).
     pub fill_first: bool,
+    /// Metres from the eye within which the fill is never taken (0: none): there are the hands and
+    /// what they hold, which move with the controllers and not with the world, so the eye's own last
+    /// frame shows them where they were (a ghost of the gun beside it). The gaps there take what is
+    /// behind them instead (`reproject.hlsl`'s `Held`).
+    pub held_reach: f32,
+    /// The camera the fill's held pixels (within [`Reprojector::held_reach`]) are drawn from: where
+    /// its frame's camera would have been had the play space then been where it is now. The hands
+    /// are tracked in the play space, which the stick moves and turns through the world, so a held
+    /// gun keeps its place in it, not in the world: drawn from this camera, the fill shows it where
+    /// it is now (less the hand's own motion since), and gaps beside it take it. Without it the fill
+    /// is never taken there. D3D11 only.
+    pub fill_held_camera: Option<Mat34>,
     /// A debug view instead of the image (`reproject.hlsl`'s `Shown`): 0 none, 1 each pixel tinted
     /// by where it came from (the fill green, a neighbour solid blue, nothing magenta), 2 its nearness as
     /// grey.
@@ -183,6 +223,7 @@ pub struct Reprojector {
     /// The view's depth pass, made at the first [`Reprojector::run_with_depth`].
     resolve_depth: Option<ID3D11ComputeShader>,
     constants: ConstantBuffer<Constants>,
+    held: ConstantBuffer<HeldMotion>,
     layers: Option<[Layer; 2]>,
     output: Option<(ID3D11Texture2D, ID3D11UnorderedAccessView)>,
     /// The view's depth ([`Reprojector::run_with_depth`]) and its size.
@@ -198,6 +239,8 @@ impl Reprojector {
         let shader = |entry| compute_shader(device, REPROJECT_SOURCE, "reproject.hlsl", entry);
         Ok(Self {
             fill_first: false,
+            held_reach: 0.0,
+            fill_held_camera: None,
             sources: 0,
             device: device.clone(),
             clear: shader(s!("Clear"))?,
@@ -206,6 +249,7 @@ impl Reprojector {
             resolve: shader(s!("Resolve"))?,
             resolve_depth: None,
             constants: ConstantBuffer::new(device)?,
+            held: ConstantBuffer::new(device)?,
             layers: None,
             output: None,
             depth_output: None,
@@ -332,13 +376,18 @@ impl Reprojector {
             unsafe { context.CSGetUnorderedAccessViews(3, Some(&mut slot3)) };
         }
         self.constants.bind(context);
-        let redraw = Constants { sources: self.sources, ..Constants::redraw(view, depth.and(depth_size), [0, 0], self.fill_first) };
+        self.held.bind_at(context, 1);
+        let redraw = Constants { sources: self.sources, held_nearness: held_nearness(view, self.held_reach), ..Constants::redraw(view, depth.and(depth_size), [0, 0], self.fill_first) };
         let splat_of = |frame: &Frame| redraw.splat(view, (frame.color.width, frame.color.height), ([0, 0], (frame.depth.width, frame.depth.height)), frame.jitter, &frame.projection, &frame.camera);
         let resolve = redraw.resolve(splat_of(primary).as_ref());
+        // The fill's held pixels from the held camera, when there is one and it makes a splat.
+        let held_m = fill.zip(self.fill_held_camera).and_then(|(frame, camera)| redraw.splat(view, (0, 0), ([0, 0], (0, 0)), [0.0; 2], &frame.projection, &camera)).map(|s| s.m);
+        let trusted = held_m.is_some() as u32;
         // SAFETY: binds our own shaders and views on the game's context, dispatches, and restores
         // what was bound.
         unsafe {
-            for (layer, frame) in layers.iter().zip([Some(primary), fill]) {
+            for ((layer, frame), held_m) in layers.iter().zip([Some(primary), fill]).zip([None, held_m]) {
+                self.held.update(context, &HeldMotion { m: held_m.unwrap_or_default(), moves: held_m.is_some() as u32, trusted, pad: [0; 2] });
                 let uavs = [Some(layer.keys_uav.clone()), Some(layer.image_uav.clone())];
                 context.CSSetUnorderedAccessViews(0, 2, Some(uavs.as_ptr()), None);
                 self.constants.update(context, &redraw);

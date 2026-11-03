@@ -12,7 +12,7 @@
 //! Recorded on a command list of the caller's; the caller owns the outputs, and every texture it
 //! passes is in COMMON and left there.
 
-use crate::reproject::{Constants, DepthRect, depth_area};
+use crate::reproject::{Constants, DepthRect, depth_area, held_nearness};
 use crate::{Error, Result, View};
 use monaka_channel::d3d12::compute::{self, DescriptorHeap, Table, srv_desc, uav_desc};
 use monaka_channel::d3d12::{self, barrier, uav_barrier};
@@ -70,6 +70,8 @@ const SETS: u32 = 8;
 pub struct Reprojector12 {
     /// The fill first where its depth agrees with the primary's (`reproject.hlsl`).
     pub fill_first: bool,
+    /// Metres from the eye within which the fill is never taken (`crate::Reprojector::held_reach`).
+    pub held_reach: f32,
     device: ID3D12Device,
     root: ID3D12RootSignature,
     clear: ID3D12PipelineState,
@@ -114,6 +116,7 @@ impl Reprojector12 {
         let pipeline = |entry| compute::shader_pipeline(device, &root, REPROJECT12_SOURCE, "reproject12.hlsl", entry).map_err(Error::Shader);
         Ok(Self {
             fill_first: false,
+            held_reach: 0.0,
             clear: pipeline(s!("Clear"))?,
             splat: pipeline(s!("Splat"))?,
             paint: pipeline(s!("Paint"))?,
@@ -162,7 +165,10 @@ impl Reprojector12 {
         self.next = self.next.wrapping_add(1);
         let layers = self.layers.as_ref().expect("made above");
         let out_area = out_depth.map(|depth| depth_area(out.depth_rect.or(primary.depth_rect), (depth.Width as u32, depth.Height)));
-        let constants = Constants::redraw(view, out_area.map(|(_, size)| size), out_area.map_or([0, 0], |(origin, _)| origin), self.fill_first);
+        let constants = Constants {
+            held_nearness: held_nearness(view, self.held_reach),
+            ..Constants::redraw(view, out_area.map(|(_, size)| size), out_area.map_or([0, 0], |(origin, _)| origin), self.fill_first)
+        };
         // The two splats, each with its source's views and its layer's.
         let sources = [Some(primary), fill];
         let mut splats: [Option<Constants>; 2] = [None, None];

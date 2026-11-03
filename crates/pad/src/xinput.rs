@@ -276,6 +276,7 @@ unsafe fn read(original: &Original<GetStateFn>, user: u32, state: *mut XInputSta
     }
     note_reader();
     COUNTERS.polls.fetch_add(1, Relaxed);
+    note_poll();
     // A producer's own press counts even while the viewer's pad is not live.
     let pressed = pressed();
     let Some(vr) = vr_pad().map(|vr| merge(vr, pressed)).or((pressed != Gamepad::default() && ACTIVE.load(Acquire)).then_some(pressed)) else {
@@ -324,6 +325,9 @@ unsafe fn read(original: &Original<GetStateFn>, user: u32, state: *mut XInputSta
     let packet = {
         let Ok(mut last) = LAST.lock() else { return result };
         if last.0 != pad || last.1 == 0 {
+            if last.0.buttons != pad.buttons {
+                BUTTON_CHANGES.fetch_add(1, Relaxed);
+            }
             last.0 = pad;
             last.1 = next_packet(last.1, real_packet, packet_floor());
         }
@@ -401,6 +405,37 @@ pub(super) fn note_reader() {
         log!("controller pad: pad 0 read by {} ({module})", Module::describe(site));
         readers.push((module, 1));
     }
+}
+
+/// Buttons handed to the game changed (a press or a release).
+static BUTTON_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// The last read of pad 0 (ms tick) and the longest gap between two reads since [`window_line`].
+static LAST_POLL: AtomicU64 = AtomicU64::new(0);
+static LONGEST_GAP: AtomicU64 = AtomicU64::new(0);
+
+fn note_poll() {
+    let now = monaka_channel::tick();
+    let last = LAST_POLL.swap(now, Relaxed);
+    if last != 0 {
+        LONGEST_GAP.fetch_max(now.saturating_sub(last), Relaxed);
+    }
+}
+
+/// Since the last call: how often the game read pad 0, the longest it went without reading it,
+/// the reads with VR input and the button changes handed to it.
+pub fn window_line() -> String {
+    static SINCE: Mutex<(u64, u64, u64, u64)> = Mutex::new((0, 0, 0, 0));
+    let now = (monaka_channel::tick(), COUNTERS.polls.load(Relaxed), COUNTERS.input.load(Relaxed), BUTTON_CHANGES.load(Relaxed));
+    let Ok(mut since) = SINCE.lock() else { return String::new() };
+    let then = std::mem::replace(&mut *since, now);
+    let seconds = (now.0.saturating_sub(then.0) as f64 / 1000.0).max(0.001);
+    let gap = LONGEST_GAP.swap(0, Relaxed);
+    format!(
+        "pad 0 read {:.0} times a second (the longest gap {gap} ms), {} reads with VR input, {} button changes handed to the game",
+        (now.1 - then.1) as f64 / seconds,
+        now.2 - then.2,
+        now.3 - then.3
+    )
 }
 
 /// End-of-run tally.

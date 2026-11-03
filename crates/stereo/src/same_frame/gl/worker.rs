@@ -7,7 +7,7 @@
 //! slot, and the render thread waits for its job. With frame generation the real pair behind each
 //! generated pair waits here for its time: the thread wakes for it between jobs.
 
-use super::{DESCRIBED_AT, GlFsr, GlShot, GlWarp, describe_warp};
+use super::{DESCRIBED_AT, GlFsr, GlFsrDlss, GlShot, GlWarp, describe_warp};
 use crate::afw::Shot;
 use crate::afw::d3d11::{Afw11, At};
 use crate::driver::{Flat, Pending};
@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D};
+use monaka_dlss11::Dlss11;
+use windows::Win32::Graphics::Direct3D11::{D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D};
 use windows::core::Interface;
 
 /// Ring slots the render thread copies eyes into: one being copied while others wait or are read.
@@ -49,6 +50,9 @@ pub(super) struct Job {
     pub depth: Option<ID3D11Texture2D>,
     pub shot: Option<GlShot>,
     pub flat: Option<Flat>,
+    /// The whole frame, drawn with both eyes side by side: its halves go out as the pair
+    /// (`GlWarp::side_by_side`).
+    pub halves: bool,
     /// The eye's size as shown (FSR's output size).
     pub display: (u32, u32),
     /// For the log: the most built frames seen waiting, and the depth copies that failed.
@@ -172,6 +176,8 @@ struct Warping {
     /// FSR's upscaler (made at the first frame, again at another size), each eye's last upscaled
     /// frame (when, the camera's position), and its counts.
     fsr: Option<Fsr11>,
+    /// DLSS's, in FSR's place ([`GlFsr::dlss`]).
+    dlss: Option<Dlss11>,
     fsr_last: [Option<(Instant, [f32; 3])>; 2],
     fsr_broken: bool,
     upscaled: u64,
@@ -192,6 +198,7 @@ impl Warping {
             channel,
             afw: None,
             fsr: None,
+            dlss: None,
             fsr_last: [None, None],
             fsr_broken: false,
             upscaled: 0,
@@ -236,8 +243,9 @@ impl Warping {
         if let Some(afw) = self.afw.take() {
             log!("{}", afw.report_line());
         }
-        if self.fsr.take().is_some() {
-            log!("FSR: {} frames upscaled, {} failed", self.upscaled, self.upscale_failures);
+        if self.fsr.take().is_some() || self.dlss.take().is_some() {
+            let name = if self.warp.fsr.is_some_and(|f| f.dlss.is_some()) { "DLSS" } else { "FSR" };
+            log!("{name}: {} frames upscaled, {} failed", self.upscaled, self.upscale_failures);
         }
     }
 
@@ -248,6 +256,7 @@ impl Warping {
             match Afw11::with_rules(&device, self.channel.clone(), self.warp.rules) {
                 Ok(mut afw) => {
                     afw.show_sources(self.warp.sources);
+                    afw.snapshots(self.warp.snapshots);
                     if let Some(framegen) = self.warp.framegen {
                         afw.frame_generation(framegen);
                     }
@@ -258,6 +267,9 @@ impl Warping {
                     return false;
                 }
             }
+        }
+        if job.halves {
+            return self.halves(&device, &context, &job);
         }
         let mut shown = match job.flat {
             Some(_) => match self.scaled(&job.image, job.display) {
@@ -319,6 +331,38 @@ impl Warping {
             WARPED.fetch_add(u64::from(job.shot.is_some()), Relaxed);
             self.window_pairs += 1;
         }
+        self.window(&job);
+        true
+    }
+
+    /// A frame drawn with both eyes side by side (a menu): its halves, at the eye size as shown, go
+    /// out as the pair.
+    fn halves(&mut self, device: &ID3D11Device, context: &ID3D11DeviceContext, job: &Job) -> bool {
+        let desc = d3d::texture_desc(&job.image);
+        let whole = (job.display.0 * 2, job.display.1);
+        let image = match (desc.Width, desc.Height) == whole {
+            true => Some(job.image.clone()),
+            false => self.scaled(&job.image, whole),
+        };
+        let Some(image) = image else {
+            self.failures += 1;
+            return true;
+        };
+        let at = At { head: PAIRS.head(), hud_rects: [[0.0; 4]; 2], flat: false, label: None, present: job.frame };
+        let publishing = Instant::now();
+        let published = self.afw.as_mut().expect("made above").publish_halves(device, context, &image, &at);
+        PAIRS.time(Stage::GlWarp, publishing.elapsed());
+        PAIRS.tally(published);
+        if published {
+            PUBLISHED.fetch_add(1, Relaxed);
+            self.window_pairs += 1;
+        }
+        self.window(job);
+        true
+    }
+
+    /// Every 10 s: the pairs a second, the counts and the stages' timing.
+    fn window(&mut self, job: &Job) {
         let start = *self.window_start.get_or_insert_with(Instant::now);
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed >= 10.0 {
@@ -331,7 +375,9 @@ impl Warping {
                 job.depth_failures,
                 job.waiting_max,
             );
-            log!("{}", afw.report_line());
+            if let Some(afw) = self.afw.as_ref() {
+                log!("{}", afw.report_line());
+            }
             let timing = PAIRS.timing_report();
             if !timing.is_empty() {
                 log!("{timing}");
@@ -342,7 +388,6 @@ impl Warping {
             self.window_start = Some(Instant::now());
             self.window_pairs = 0;
         }
-        true
     }
 
     /// `image` resampled to `size` (a flat frame, or one FSR did not upscale).
@@ -358,6 +403,9 @@ impl Warping {
     fn upscale(&mut self, fsr: GlFsr, shot: &Shot, colour: &ID3D11Texture2D, depth: &ID3D11Texture2D, jitter: [f32; 2], display: (u32, u32)) -> Option<ID3D11Texture2D> {
         if self.fsr_broken {
             return None;
+        }
+        if let Some(dlss) = fsr.dlss {
+            return self.upscale_dlss(fsr, dlss, shot, colour, depth, jitter, display);
         }
         let desc = d3d::texture_desc(colour);
         let render = (desc.Width, desc.Height);
@@ -410,6 +458,69 @@ impl Warping {
             Err(e) => {
                 if self.upscale_failures < 5 {
                     log!("FSR upscale failed: {e}");
+                }
+                self.upscale_failures += 1;
+                None
+            }
+        }
+    }
+
+    /// [`Self::upscale`] by DLSS: the eye `colour` with its `depth` (both whole, the render size).
+    #[allow(clippy::too_many_arguments)]
+    fn upscale_dlss(&mut self, fsr: GlFsr, dlss: GlFsrDlss, shot: &Shot, colour: &ID3D11Texture2D, depth: &ID3D11Texture2D, jitter: [f32; 2], display: (u32, u32)) -> Option<ID3D11Texture2D> {
+        let desc = d3d::texture_desc(colour);
+        let render = (desc.Width, desc.Height);
+        if self.dlss.as_ref().is_none_or(|made| made.render() != render || made.display() != display) {
+            self.dlss = None;
+            let settings = monaka_dlss11::Settings {
+                render,
+                display,
+                quality: dlss.quality,
+                data_dir: dlss.data.to_path_buf(),
+                dll_dirs: vec![fsr.dlls.to_path_buf()],
+                jitter_sign: fsr.jitter_sign,
+                sharpness: fsr.sharpness,
+            };
+            match Dlss11::new(&self.device, &self.context, settings) {
+                Ok(made) => {
+                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), render.0, render.1, display.0, display.1, fsr.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
+                    self.dlss = Some(made);
+                    self.fsr_last = [None, None];
+                }
+                Err(e) => {
+                    log!("DLSS unavailable: {e}; the eye is resampled instead");
+                    self.fsr_broken = true;
+                    return None;
+                }
+            }
+        }
+        let rendered = &shot.rendered;
+        let camera = rendered.camera;
+        let position = [camera[3], camera[7], camera[11]];
+        let now = Instant::now();
+        let eye = shot.eye.min(1);
+        let (frame_time_ms, cut) = frame_time_and_cut(self.fsr_last[eye], now, position);
+        self.fsr_last[eye] = Some((now, position));
+        let whole = |(width, height): (u32, u32)| D3D11_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+        let depth_desc = d3d::texture_desc(depth);
+        let frame = monaka_dlss11::EyeFrame {
+            color: colour,
+            color_box: whole(render),
+            depth,
+            depth_box: whole((depth_desc.Width.min(render.0), depth_desc.Height.min(render.1))),
+            view: EyeView { camera, projection: rendered.projection },
+            jitter,
+            frame_time_ms,
+            reset: cut,
+        };
+        match self.dlss.as_mut()?.upscale(&self.context, eye, &frame) {
+            Ok(image) => {
+                self.upscaled += 1;
+                Some(image)
+            }
+            Err(e) => {
+                if self.upscale_failures < 5 {
+                    log!("DLSS upscale failed: {e}");
                 }
                 self.upscale_failures += 1;
                 None
