@@ -897,6 +897,7 @@ pub const BINARY_FINGERS: Opt =
 /// included), common headsets' panels, or the game's own resolution.
 pub const RENDER_SIZES: &[(&str, &str)] = &[
     ("headset", "Let the headset pick"),
+    ("2560x2560", "Bigscreen Beyond 2e (2560 x 2560)"),
     ("2160x2160", "Steam Frame (2160 x 2160)"),
     ("2064x2208", "Quest 3 (2064 x 2208)"),
     ("1832x1920", "Quest 2 (1832 x 1920)"),
