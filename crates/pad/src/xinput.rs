@@ -326,7 +326,10 @@ unsafe fn read(original: &Original<GetStateFn>, user: u32, state: *mut XInputSta
         let Ok(mut last) = LAST.lock() else { return result };
         if last.0 != pad || last.1 == 0 {
             if last.0.buttons != pad.buttons {
-                BUTTON_CHANGES.fetch_add(1, Relaxed);
+                // The first few hundred logged, for how long a press takes to show in the game.
+                if BUTTON_CHANGES.fetch_add(1, Relaxed) < 400 {
+                    log!("controller pad: buttons {:#06x} -> {:#06x} handed to the game", last.0.buttons, pad.buttons);
+                }
             }
             last.0 = pad;
             last.1 = next_packet(last.1, real_packet, packet_floor());

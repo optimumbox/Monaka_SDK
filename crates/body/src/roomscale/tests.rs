@@ -67,3 +67,19 @@ fn an_unreadable_body_measures_nothing() {
     last.begin(Some([0.02, 0.0, 0.0]), 0.02, || None, |_| [1.0, 0.0], |_, _, _| credited += 1);
     assert_eq!(credited, 0, "a step either side of an unreadable one is not measured");
 }
+
+#[test]
+fn a_move_by_the_stick_goes_whole_into_the_anchor() {
+    let mut state = STATE.lock().unwrap();
+    let saved = (state.settings, state.anchor, state.axes);
+    state.settings = Some(Settings { max_speed: 3.0, response: 0.12, deadzone: 0.03, test_step: None });
+    state.anchor = [0.0; 2];
+    // Tracking x along world -z, tracking z along world x (the room turned a quarter).
+    state.axes = Some(([0.0, 0.0, -1.0], [1.0, 0.0, 0.0]));
+    drop(state);
+    moved([0.3, 0.5, -0.2]);
+    let mut state = STATE.lock().unwrap();
+    let anchor = state.anchor;
+    (state.settings, state.anchor, state.axes) = saved;
+    assert!((anchor[0] - 0.2).abs() < 1e-6 && (anchor[1] - 0.3).abs() < 1e-6, "height left out, the rest in tracking axes: {anchor:?}");
+}

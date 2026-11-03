@@ -273,6 +273,22 @@ pub fn credit(beyond: [f32; 3], follow: [f32; 2], dt: f32) {
     state.stats.followed += followed;
 }
 
+/// The character moved `world` (x and z taken) for following alone: a game that walks it by its
+/// own movement input (the stick) instead of a velocity of its own, whose move may run on past what
+/// was asked (the game's acceleration and braking), credits the whole move into the anchor, so the
+/// view never moves twice.
+pub fn moved(world: [f32; 3]) {
+    if !world.iter().all(|c| c.is_finite()) {
+        return;
+    }
+    let Ok(mut state) = STATE.lock() else { return };
+    let Some((x_axis, z_axis)) = state.axes.filter(|_| state.settings.is_some()) else { return };
+    let world = [world[0], 0.0, world[2]];
+    state.anchor[0] += dot(world, x_axis);
+    state.anchor[1] += dot(world, z_axis);
+    state.stats.followed += world[0].hypot(world[2]);
+}
+
 /// A step measured at the next one: the body's position as the previous step began, and what
 /// that step asked (the game's own velocity, the following velocity and the step's length).
 struct LastStep {
