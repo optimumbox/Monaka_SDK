@@ -256,6 +256,10 @@ pub(crate) fn install(channel: ChannelName, side_by_side: bool, warp: Option<GlW
         log!("frame warping: one eye per frame, the other warped from it with its depth");
     }
     let pair_depth = pair_depth.filter(|_| side_by_side && warp.is_none());
+    // A video goes out flat, scaled, while the game is still to switch to the eye size.
+    if side_by_side && warp.is_none() {
+        crate::eye_size::videos_shown_while_waiting();
+    }
     if pair_depth.is_some() {
         log!("each eye's depth goes to the headset with its pair");
     }
@@ -393,6 +397,18 @@ impl State {
         if self.broken {
             return;
         }
+        // Nothing goes out at another size than the game was asked for (`crate::eye_size`): the
+        // channel is made at the first pair's size, and the game's window may still be resized
+        // around its context. A video meanwhile (the intros of a game joined as it starts, which
+        // it switches only after) goes out flat, scaled to the size asked for, so it shows at once
+        // and the channel is made at the size the game's frames will have.
+        let Some((width, height)) = client_size(dc) else { return self.fail("no window size") };
+        let waiting = PAIRS.settings().is_some_and(|settings| !(settings.ready)(width, height));
+        let scaled_to = match (waiting, crate::eye_size::pending()) {
+            (false, _) => None,
+            (true, Some(asked)) if self.side_by_side && self.warp.is_none() => Some(asked),
+            (true, _) => return,
+        };
         if self.bridge.is_none() {
             let made = d3d::create_device(None).map_err(|e| e.to_string()).and_then(|(device, context, _)| Bridge::new(&device).map(|bridge| (bridge, context)).map_err(|e| e.to_string()));
             match made {
@@ -408,14 +424,13 @@ impl State {
                 }
             }
         }
-        let Some((width, height)) = client_size(dc) else { return self.fail("no window size") };
-        FRAME_SIZE.store(u64::from(width) << 32 | u64::from(height), Relaxed);
-        // The channel is made at the first frame's size: nothing goes out until the game may
-        // publish at this one (`crate::eye_size::ready`, while it is asked for the eye size).
-        if PAIRS.settings().is_some_and(|s| !(s.ready)(width, height)) {
+        // A frame the engine draws over the whole window (a video) is not per eye: it goes flat.
+        let flat = if self.side_by_side { PAIRS.flat_now(PAIRS.settings().and_then(|s| s.flat)) } else { None };
+        if scaled_to.is_some() && flat.is_none() {
             return;
         }
-        let (eye_width, eye_height) = eye_size((width, height), self.side_by_side);
+        FRAME_SIZE.store(u64::from(width) << 32 | u64::from(height), Relaxed);
+        let (eye_width, eye_height) = scaled_to.unwrap_or_else(|| eye_size((width, height), self.side_by_side));
         if let Some(warp) = self.warp {
             return self.warped(frame, warp, (width, height));
         }
@@ -431,9 +446,6 @@ impl State {
             Err(e) => return self.fail(format!("capture: {e}")),
         };
         PAIRS.time(Stage::GlColour, copying.elapsed());
-
-        // A frame the engine draws over the whole window (a video) is not per eye: it goes flat.
-        let flat = if self.side_by_side { PAIRS.flat_now(PAIRS.settings().and_then(|s| s.flat)) } else { None };
         if flat != self.flat {
             match flat {
                 Some(reason) => log!("frame {frame}: {}: whole frames to the flat screen", reason.label()),
