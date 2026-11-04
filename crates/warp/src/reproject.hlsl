@@ -287,6 +287,44 @@ bool Held(uint fill) {
     return !HeldTrusted && HeldNearness > 0 && Nearness(fill) / NEARNESS_STEPS > HeldNearness;
 }
 
+// Whether the fill's pixel `fill` is a held thing moved with the play space (HeldMoves) though not
+// trusted everywhere (Held): taken only inside the primary's own held surface (HeldInside).
+bool HeldMoved(uint fill) {
+    return HeldMoves && HeldNearness > 0 && fill && Nearness(fill) / NEARNESS_STEPS > HeldNearness;
+}
+
+// How far along each axis the primary's held surface is looked for about a gap (HeldInside).
+static const int HELD_INSIDE_REACH = 24;
+
+// Whether a gap at `p` lies inside the primary's held surface at about nearness `near`: such a
+// surface (within a tenth) first met both left and right of it, or both above and below, within
+// HELD_INSIDE_REACH (empty pixels passed over, a farther one ending the look).
+bool Enclosed(uint2 p, uint near) {
+    bool found[4] = { false, false, false, false };
+    const int2 dirs[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    [unroll] for (int d = 0; d < 4; ++d) {
+        [loop] for (int r = 1; r <= HELD_INSIDE_REACH; ++r) {
+            int2 q = int2(p) + dirs[d] * r;
+            if (!Inside(q)) break;
+            uint k = PrimaryKeys.Load(int3(q, 0));
+            if (!k) continue;
+            uint n = Nearness(k);
+            found[d] = n + near / 10 >= near && n <= near + near / 10;
+            break;
+        }
+    }
+    return (found[0] && found[1]) || (found[2] && found[3]);
+}
+
+// Whether the gap at `p` takes the fill's held pixel `fill` (HeldMoved): inside the primary's held
+// surface, where the eye's own last frame saw a side of a held gun this eye's warp cannot (a hand's
+// length away, its sides are seen by one eye only): its real surface rather than lines of its
+// neighbours drawn across. Outside it the fill's held thing stays out (a ghost of the gun where the
+// hand was a frame ago).
+bool HeldInside(uint2 p, uint fill) {
+    return HeldMoved(fill) && Enclosed(p, Nearness(fill));
+}
+
 // Whether the fill's pixel at `p` (key `fill`) goes out over the primary's (key `primary`): the
 // same surface with FillFirst, or a clearly nearer one the primary's eye could not see (hidden).
 bool FillOver(uint2 p, uint fill, uint primary) {
@@ -318,9 +356,10 @@ bool FillsGap(uint2 p, uint fill) {
         Out[id.xy] = FillOver(id.xy, fill, primary) ? Shown(Fill.Load(int3(id.xy, 0)), fill, 1) : Shown(Primary.Load(int3(id.xy, 0)), primary, 0);
         return;
     }
+    uint fill = FillKeys.Load(int3(id.xy, 0));
+    if (HeldInside(id.xy, fill)) { Out[id.xy] = Shown(Fill.Load(int3(id.xy, 0)), fill, 1); return; }
     int2 crack = Crack(id.xy);
     if (crack.x >= 0) { Out[id.xy] = Shown(Primary.Load(int3(crack, 0)), PrimaryKeys.Load(int3(crack, 0)), 2); return; }
-    uint fill = FillKeys.Load(int3(id.xy, 0));
     uint hole_key; int2 hole = Hole(id.xy, fill, hole_key);
     if (hole.x >= 0) { Out[id.xy] = Shown(Primary.Load(int3(hole, 0)), hole_key, 2); return; }
     if (FillsGap(id.xy, fill)) { Out[id.xy] = Shown(Fill.Load(int3(id.xy, 0)), fill, 1); return; }
@@ -334,6 +373,7 @@ bool FillsGap(uint2 p, uint fill) {
     uint key = PrimaryKeys.Load(int3(p, 0));
     uint fill = FillKeys.Load(int3(p, 0));
     if (key && FillOver(p, fill, key)) key = fill;
+    if (!key && HeldInside(p, fill)) key = fill;
     if (!key) {
         int2 crack = Crack(p);
         if (crack.x >= 0) key = PrimaryKeys.Load(int3(crack, 0));

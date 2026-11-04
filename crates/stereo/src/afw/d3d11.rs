@@ -421,7 +421,9 @@ impl Afw11 {
             }
         }
         let target = warp.target.view(desc.Width, desc.Height);
-        self.reprojector.fill_held_camera = fill.filter(|_| self.held_fill).zip(self.frame_poses[other]).and_then(|(fill, then)| held_camera(&fill.camera, &then, &warp.target.camera, &shot.pose));
+        // Without held_fill the moved held pixels are still taken inside the warped gun's own outline.
+        self.reprojector.fill_held_trusted = self.held_fill;
+        self.reprojector.fill_held_camera = fill.zip(self.frame_poses[other]).and_then(|(fill, then)| held_camera(&fill.camera, &then, &warp.target.camera, &shot.pose));
         if let Some(held) = self.reprojector.fill_held_camera.filter(|_| self.held_logged < 8)
             && let Some(fill) = fill
         {

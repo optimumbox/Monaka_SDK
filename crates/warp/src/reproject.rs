@@ -211,6 +211,10 @@ pub struct Reprojector {
     /// it is now (less the hand's own motion since), and gaps beside it take it. Without it the fill
     /// is never taken there. D3D11 only.
     pub fill_held_camera: Option<Mat34>,
+    /// Whether the fill's held pixels moved by [`Reprojector::fill_held_camera`] are taken wherever
+    /// the fill is (true), or only in gaps inside the primary's own held surface (false: elsewhere
+    /// a hand moved since the fill's frame puts a second gun beside the warped one).
+    pub fill_held_trusted: bool,
     /// A debug view instead of the image (`reproject.hlsl`'s `Shown`): 0 none, 1 each pixel tinted
     /// by where it came from (the fill green, a neighbour solid blue, nothing magenta), 2 its nearness as
     /// grey.
@@ -241,6 +245,7 @@ impl Reprojector {
             fill_first: false,
             held_reach: 0.0,
             fill_held_camera: None,
+            fill_held_trusted: true,
             sources: 0,
             device: device.clone(),
             clear: shader(s!("Clear"))?,
@@ -382,7 +387,7 @@ impl Reprojector {
         let resolve = redraw.resolve(splat_of(primary).as_ref());
         // The fill's held pixels from the held camera, when there is one and it makes a splat.
         let held_m = fill.zip(self.fill_held_camera).and_then(|(frame, camera)| redraw.splat(view, (0, 0), ([0, 0], (0, 0)), [0.0; 2], &frame.projection, &camera)).map(|s| s.m);
-        let trusted = held_m.is_some() as u32;
+        let trusted = (held_m.is_some() && self.fill_held_trusted) as u32;
         // SAFETY: binds our own shaders and views on the game's context, dispatches, and restores
         // what was bound.
         unsafe {
