@@ -24,7 +24,8 @@ struct Constants {
     depth_height: u32,
     object_scale: [f32; 2],
     has_object: u32,
-    pad: u32,
+    flags: u32,
+    linear: [f32; 4],
 }
 
 /// One eye's camera for a frame: canonical camera-to-world and the depth buffer's projection.
@@ -38,6 +39,14 @@ pub struct EyeView {
 pub struct ObjectMotion<'a> {
     pub texture: &'a ID3D11Texture2D,
     pub scale: [f32; 2],
+}
+
+/// Where pixels moved on their own (`motion.hlsl`'s mask): the eye's previous depth as the pass
+/// wrote it (R32_FLOAT, render size; none: the eye's first frame) and the mask written (a
+/// single-channel UNORM or float view, render size).
+pub struct Moved<'a> {
+    pub previous_depth: Option<&'a ID3D11ShaderResourceView>,
+    pub mask: &'a ID3D11UnorderedAccessView,
 }
 
 pub struct MotionPass {
@@ -90,6 +99,23 @@ impl MotionPass {
         object: Option<ObjectMotion<'_>>,
         motion: &ID3D11UnorderedAccessView,
         depth_out: &ID3D11UnorderedAccessView,
+        size: (u32, u32),
+    ) -> Result<()> {
+        self.run_moved(context, depth, current, previous, object, motion, depth_out, None, size)
+    }
+
+    /// [`Self::run`], and with `moved` the mask of where pixels moved on their own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_moved(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        depth: &ID3D11Texture2D,
+        current: &EyeView,
+        previous: Option<&EyeView>,
+        object: Option<ObjectMotion<'_>>,
+        motion: &ID3D11UnorderedAccessView,
+        depth_out: &ID3D11UnorderedAccessView,
+        moved: Option<Moved<'_>>,
         (width, height): (u32, u32),
     ) -> Result<()> {
         let depth_desc = d3d::texture_desc(depth);
@@ -102,6 +128,9 @@ impl MotionPass {
             None => reprojection(&current.projection, &current.camera, &current.projection, &current.camera).ok_or(Error::Unsupported("singular camera"))?,
         };
         let object_view = object.as_ref().and_then(|o| self.object_view(o.texture));
+        let previous_depth = moved.as_ref().and_then(|m| m.previous_depth).filter(|_| previous.is_some()).cloned();
+        let flags = u32::from(moved.is_some()) | (u32::from(previous_depth.is_some()) << 1);
+        let p = previous.map_or(current.projection, |v| v.projection);
         let constants = Constants {
             m,
             width,
@@ -110,7 +139,8 @@ impl MotionPass {
             depth_height: depth_desc.Height,
             object_scale: object.as_ref().map_or([0.0; 2], |o| o.scale),
             has_object: u32::from(object_view.is_some()),
-            pad: 0,
+            flags,
+            linear: [p[10], p[11], p[14], p[15]],
         };
         let saved = SavedCompute::take(context);
         // SAFETY: copies the game's depth into our same-shaped typeless copy.
@@ -121,11 +151,12 @@ impl MotionPass {
         // bindings go back after.
         unsafe {
             context.CSSetShader(&self.shader, None);
-            context.CSSetShaderResources(0, Some(&[Some(copy.view.clone()), object_view]));
-            context.CSSetUnorderedAccessViews(0, 2, Some([Some(motion.clone()), Some(depth_out.clone())].as_ptr()), None);
+            context.CSSetShaderResources(0, Some(&[Some(copy.view.clone()), object_view, previous_depth]));
+            let mask = moved.as_ref().map(|m| m.mask.clone());
+            context.CSSetUnorderedAccessViews(0, 3, Some([Some(motion.clone()), Some(depth_out.clone()), mask].as_ptr()), None);
             context.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
-            context.CSSetUnorderedAccessViews(0, 2, Some([None, None].as_ptr()), None);
-            context.CSSetShaderResources(0, Some(&[None, None]));
+            context.CSSetUnorderedAccessViews(0, 3, Some([None, None, None].as_ptr()), None);
+            context.CSSetShaderResources(0, Some(&[None, None, None]));
         }
         saved.restore(context);
         self.depth = Some(copy);

@@ -31,7 +31,7 @@ mod sharpen;
 pub mod reproject12;
 pub mod warp12;
 pub use hud::{HUD_SOURCE, HudLayer};
-pub use motion::{EyeView, MOTION_SOURCE, MotionPass, ObjectMotion};
+pub use motion::{EyeView, MOTION_SOURCE, MotionPass, Moved, ObjectMotion};
 pub use reproject::{Frame, REPROJECT_SOURCE, Reprojector, View, source_matrix};
 pub use scale::{SCALE_SOURCE, Scaler, fit};
 pub use sharpen::{SHARPEN_SOURCE, SharpenPass};

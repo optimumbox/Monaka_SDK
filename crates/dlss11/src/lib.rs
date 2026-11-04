@@ -4,6 +4,10 @@
 //! 1. each eye's part of the captured frame and of its depth is copied into render-size textures;
 //! 2. its motion vectors are written from that depth and the eye's camera now and at its previous
 //!    frame ([`monaka_warp::MotionPass`]: the camera's motion only);
+//!    With them, a mask of where pixels moved on their own (an enemy walking, the gun in a moving
+//!    hand: what lands on nothing that far away in the eye's previous depth), which DLSS takes from
+//!    the current frame rather than its history ("bias current colour"): with the camera's motion
+//!    alone, its history would ghost around them;
 //! 3. the eye's own DLSS feature (one history per eye) upscales it to the eye size;
 //! 4. with [`Settings::sharpness`], AMD's CAS sharpens it ([`monaka_warp::SharpenPass`]), as DLSS's
 //!    own sharpening no longer does.
@@ -16,7 +20,7 @@
 mod ngx;
 
 use monaka_channel::d3d;
-use monaka_warp::{EyeView, MotionPass, SharpenPass};
+use monaka_warp::{EyeView, MotionPass, Moved, SharpenPass};
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D11::{
@@ -25,7 +29,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16G16_FLOAT,
-    DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32_FLOAT,
 };
 use windows::core::Interface;
 
@@ -181,6 +185,8 @@ struct Eye {
     /// With sharpening: what DLSS writes, and a view the sharpening reads it by.
     upscaled: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     previous: Option<EyeView>,
+    /// The eye's depth as last written (render size), for the moved mask.
+    previous_depth: (ID3D11Texture2D, ID3D11ShaderResourceView),
 }
 
 pub struct Dlss11 {
@@ -194,6 +200,8 @@ pub struct Dlss11 {
     depth_in: ID3D11Texture2D,
     depth: (ID3D11Texture2D, ID3D11UnorderedAccessView),
     motion_vectors: (ID3D11Texture2D, ID3D11UnorderedAccessView),
+    /// Where pixels moved on their own (render size, shared by both eyes like the inputs).
+    moved: (ID3D11Texture2D, ID3D11UnorderedAccessView),
     eyes: Vec<Eye>,
 }
 
@@ -296,12 +304,13 @@ impl Dlss11 {
         let depth_in = texture(device, render, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
         let depth = with_uav(device, render, DXGI_FORMAT_R32_FLOAT)?;
         let motion_vectors = with_uav(device, render, DXGI_FORMAT_R16G16_FLOAT)?;
+        let moved = with_uav(device, render, DXGI_FORMAT_R8_UNORM)?;
         let sharpen = match settings.sharpness {
             Some(_) => Some(SharpenPass::new(device).map_err(|e| Error::Failed(format!("sharpening: {e}")))?),
             None => None,
         };
         let motion = MotionPass::new(device).map_err(|e| Error::Failed(format!("motion pass: {e}")))?;
-        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, eyes: Vec::new() };
+        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, moved, eyes: Vec::new() };
         for _ in 0..2 {
             let output = with_uav(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?;
             let upscaled = match this.sharpen {
@@ -309,7 +318,8 @@ impl Dlss11 {
                 None => None,
             };
             let handle = this.create_feature(context)?;
-            this.eyes.push(Eye { handle, output, upscaled, previous: None });
+            let previous_depth = with_srv(device, render, DXGI_FORMAT_R32_FLOAT)?;
+            this.eyes.push(Eye { handle, output, upscaled, previous: None, previous_depth });
         }
         Ok(this)
     }
@@ -361,9 +371,12 @@ impl Dlss11 {
         }
         let state = &mut self.eyes[eye];
         let previous = if frame.reset { None } else { state.previous };
+        let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1 };
         self.motion
-            .run(context, &self.depth_in, &frame.view, previous.as_ref(), None, &self.motion_vectors.1, &self.depth.1, render)
+            .run_moved(context, &self.depth_in, &frame.view, previous.as_ref(), None, &self.motion_vectors.1, &self.depth.1, Some(moved), render)
             .map_err(|e| Error::Failed(format!("motion vectors: {e}")))?;
+        // SAFETY: copies between two of our own same-shaped R32 textures on our context.
+        unsafe { context.CopyResource(&state.previous_depth.0, &self.depth.0) };
         let p = self.parameters;
         let sign = self.settings.jitter_sign;
         let resource = |t: &ID3D11Texture2D| t.as_raw() as *mut c_void;
@@ -374,6 +387,9 @@ impl Dlss11 {
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Output".as_ptr(), resource(written));
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"Depth".as_ptr(), resource(&self.depth.0));
             ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"MotionVectors".as_ptr(), resource(&self.motion_vectors.0));
+            ngx::NVSDK_NGX_Parameter_SetD3d11Resource(p, c"DLSS.Input.Bias.Current.Color.Mask".as_ptr(), resource(&self.moved.0));
+            ngx::NVSDK_NGX_Parameter_SetUI(p, c"DLSS.Input.Bias.Current.Color.SubrectBase.X".as_ptr(), 0);
+            ngx::NVSDK_NGX_Parameter_SetUI(p, c"DLSS.Input.Bias.Current.Color.SubrectBase.Y".as_ptr(), 0);
             ngx::NVSDK_NGX_Parameter_SetF(p, c"Jitter.Offset.X".as_ptr(), sign * frame.jitter[0]);
             ngx::NVSDK_NGX_Parameter_SetF(p, c"Jitter.Offset.Y".as_ptr(), sign * frame.jitter[1]);
             ngx::NVSDK_NGX_Parameter_SetF(p, c"Sharpness".as_ptr(), 0.0);
