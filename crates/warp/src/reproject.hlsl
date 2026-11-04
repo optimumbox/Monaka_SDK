@@ -294,12 +294,15 @@ bool HeldMoved(uint fill) {
 }
 
 // How far along each axis the primary's held surface is looked for about a gap (HeldInside).
-static const int HELD_INSIDE_REACH = 24;
+// A hand's length from the eyes their views of an arm or gun lie well over a hundred pixels apart,
+// so its sides seen by one eye only can be tens of pixels wide.
+static const int HELD_INSIDE_REACH = 64;
 
-// Whether a gap at `p` lies inside the primary's held surface at about nearness `near`: such a
-// surface (within a tenth) first met both left and right of it, or both above and below, within
-// HELD_INSIDE_REACH (empty pixels passed over, a farther one ending the look).
-bool Enclosed(uint2 p, uint near) {
+// Whether a gap at `p` lies inside the primary's held things: a held pixel (within the hands'
+// reach, at any nearness: an arm runs from near to far, a hand lies behind its gun) first met both
+// left and right of it, or both above and below, within HELD_INSIDE_REACH (empty pixels passed
+// over, a farther one ending the look).
+bool Enclosed(uint2 p) {
     bool found[4] = { false, false, false, false };
     const int2 dirs[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
     [unroll] for (int d = 0; d < 4; ++d) {
@@ -308,8 +311,7 @@ bool Enclosed(uint2 p, uint near) {
             if (!Inside(q)) break;
             uint k = PrimaryKeys.Load(int3(q, 0));
             if (!k) continue;
-            uint n = Nearness(k);
-            found[d] = n + near / 10 >= near && n <= near + near / 10;
+            found[d] = Nearness(k) / NEARNESS_STEPS > HeldNearness;
             break;
         }
     }
@@ -322,7 +324,7 @@ bool Enclosed(uint2 p, uint near) {
 // neighbours drawn across. Outside it the fill's held thing stays out (a ghost of the gun where the
 // hand was a frame ago).
 bool HeldInside(uint2 p, uint fill) {
-    return HeldMoved(fill) && Enclosed(p, Nearness(fill));
+    return HeldMoved(fill) && Enclosed(p);
 }
 
 // Whether the fill's pixel at `p` (key `fill`) goes out over the primary's (key `primary`): the
