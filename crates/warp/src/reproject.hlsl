@@ -31,7 +31,8 @@
 // writes the target's depth in its own convention (depth = (nearness - NearB) / NearA).
 // The output's alpha says where each pixel came from, in thirds (a 2-bit alpha holds it too): 1 the
 // primary, 2/3 the fill, 1/3 the primary's own neighbour (across a crack or behind a gap), 0
-// nothing. The headset ignores alpha; captures read it.
+// nothing. The headset ignores alpha; captures read it. The resolves read the primary's own colour
+// at Color (t0), to tell a fill point gone since its frame (Gone).
 cbuffer Reproject : register(b0) {
     row_major float4x4 M;
     uint W, H, SW, SH;
@@ -162,19 +163,55 @@ bool Inside(int2 p) { return p.x >= 0 && p.y >= 0 && p.x < int(W) && p.y < int(H
 // (the point is not there any more); OUTSIDE, out of that eye's view or no primary depth; SAME, the
 // point itself. The primary's depth is in the target's convention (both eyes share depth terms).
 static const uint HIDDEN = 0, PAST = 1, OUTSIDE = 2, SAME = 3;
-uint Seen(uint2 p, uint fill) {
+// SeenAt also says where in the primary's frame the point lies (its NDC in `at_ndc`), and whether
+// that eye sees anything there in front of it at all (`in_front`: nearer by a sixty-fourth).
+uint SeenAt(uint2 p, uint fill, out float2 at_ndc, out bool in_front) {
+    at_ndc = float2(0, 0); in_front = false;
     if (PrimaryDepth.z == 0 || PrimaryDepth.w == 0) return OUTSIDE;
     float here = Nearness(fill) / NEARNESS_STEPS;
     float2 ndc = float2((p.x + 0.5) / W * 2 - 1, 1 - (p.y + 0.5) / H * 2);
     float4 s = mul(Back, float4(ndc, (here - NearB) / NearA, 1));
     if (!(s.w > 0)) return OUTSIDE;
     s /= s.w;
+    at_ndc = s.xy;
     if (any(abs(s.xy) >= 1)) return OUTSIDE;
     int2 texel = clamp(int2(float2((s.x + 1) * 0.5, (1 - s.y) * 0.5) * float2(PrimaryDepth.zw)), int2(0, 0), int2(PrimaryDepth.zw) - 1) + int2(PrimaryDepth.xy);
     float seen = NearA * Depth.Load(int3(texel, 0)) + NearB, at = NearA * s.z + NearB;
+    in_front = seen > at + at / 64;
     if (seen > at + at / 8) return HIDDEN;
     if (seen + at / 8 < at) return PAST;
     return SAME;
+}
+uint Seen(uint2 p, uint fill) { float2 at; bool in_front; return SeenAt(p, fill, at, in_front); }
+
+// How far apart in colour (the largest channel) the fill's point and the primary eye's view of it
+// may be and still be one thing.
+static const float RECOLOURED = 0.25;
+
+// Whether the fill's point at `p` (key `fill`), which the primary's eye sees at about its depth
+// (SAME) with nothing in front of it, is shown there in another colour by every primary pixel
+// around it: the point has gone
+// since the fill's frame (where a walking character or the swung gun was 22 ms ago, a wall a hand's
+// breadth behind it matching its depth). The depth alone lets the old place through as a sliver
+// beside the thing, on alternate eyes each frame: a flicker. Where that eye sees something in
+// front of the point (the thing beside the gap, a little nearer than the wall it uncovers) the
+// colours differ as they should: never then, nor without the primary's colour (t0 unbound).
+bool Gone(uint2 p, uint fill) {
+    float2 at; bool in_front;
+    if (SeenAt(p, fill, at, in_front) != SAME || in_front) return false;
+    uint cw, ch;
+    Color.GetDimensions(cw, ch);
+    if (cw == 0 || ch == 0) return false;
+    int2 c = int2(float2((at.x + 1) * 0.5, (1 - at.y) * 0.5) * float2(cw, ch));
+    float3 mine = Fill.Load(int3(p, 0)).rgb;
+    [loop] for (int y = -1; y <= 1; ++y) {
+        [loop] for (int x = -1; x <= 1; ++x) {
+            int2 q = clamp(c + int2(x, y), int2(0, 0), int2(cw, ch) - 1);
+            float3 d = abs(Color.Load(int3(q, 0)).rgb - mine);
+            if (max(d.r, max(d.g, d.b)) <= RECOLOURED) return false;
+        }
+    }
+    return true;
 }
 
 // A crack: a target pixel no source pixel landed on inside one of the primary's surfaces (a surface
@@ -324,7 +361,7 @@ bool Enclosed(uint2 p) {
 // neighbours drawn across. Outside it the fill's held thing stays out (a ghost of the gun where the
 // hand was a frame ago).
 bool HeldInside(uint2 p, uint fill) {
-    return HeldMoved(fill) && Enclosed(p);
+    return HeldMoved(fill) && Enclosed(p) && !Gone(p, fill);
 }
 
 // Whether the fill's pixel at `p` (key `fill`) goes out over the primary's (key `primary`): the
@@ -339,7 +376,7 @@ bool FillOver(uint2 p, uint fill, uint primary) {
 // Whether the fill's pixel at `p` (key `fill`) fills the gap there: anything but a point the
 // primary's eye saw past (gone since).
 bool FillsGap(uint2 p, uint fill) {
-    return fill && !Held(fill) && Seen(p, fill) != PAST;
+    return fill && !Held(fill) && Seen(p, fill) != PAST && !Gone(p, fill);
 }
 
 [numthreads(8, 8, 1)] void Resolve(uint3 id : SV_DispatchThreadID) {

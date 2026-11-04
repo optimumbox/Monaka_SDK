@@ -201,6 +201,8 @@ impl Reprojector12 {
         unsafe {
             self.null_sources(set, format);
             if splats[0].is_some() {
+                // Its colour too, for telling a fill point gone since its frame (Gone).
+                self.device.CreateShaderResourceView(primary.color, Some(&srv_desc(read_format(primary.color.GetDesc().Format))), self.heap.cpu(set));
                 let depth_format = depth_read_format(primary.depth.GetDesc().Format).ok_or(Error::Unsupported("depth format"))?;
                 self.device.CreateShaderResourceView(primary.depth, Some(&srv_desc(depth_format)), self.heap.cpu(set + 1));
             }

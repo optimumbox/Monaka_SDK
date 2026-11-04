@@ -412,8 +412,9 @@ impl Reprojector {
             self.constants.update(context, &resolve);
             context.CSSetUnorderedAccessViews(0, 3, Some([None, None, Some(output_uav.clone())].as_ptr()), None);
             // The primary's depth, for asking its eye about the fill.
+            // Its colour, for telling a fill point gone since its frame (`reproject.hlsl`'s Gone).
             let resources = [
-                None,
+                Some(primary.color.view.clone()),
                 Some(primary.depth.view.clone()),
                 Some(layers[0].image_srv.clone()),
                 Some(layers[1].image_srv.clone()),
