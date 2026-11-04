@@ -214,6 +214,22 @@ bool Gone(uint2 p, uint fill) {
     return true;
 }
 
+// Whether the fill's colour at target pixel `p` is within RECOLOURED of the primary's there or at
+// one of its neighbours (pixels the primary landed on): one thing seen by both, its shading as the
+// eye itself saw it, rather than something that moved and left its depth behind.
+bool Agrees(uint2 p) {
+    float3 mine = Fill.Load(int3(p, 0)).rgb;
+    [loop] for (int y = -1; y <= 1; ++y) {
+        [loop] for (int x = -1; x <= 1; ++x) {
+            int2 q = int2(p) + int2(x, y);
+            if (!Inside(q) || !PrimaryKeys.Load(int3(q, 0))) continue;
+            float3 d = abs(Primary.Load(int3(q, 0)).rgb - mine);
+            if (max(d.r, max(d.g, d.b)) <= RECOLOURED) return true;
+        }
+    }
+    return false;
+}
+
 // A crack: a target pixel no source pixel landed on inside one of the primary's surfaces (a surface
 // drawn larger than in its source, nearer or turned toward this eye, leaves such pixels in a grid).
 // Told from a gap beside a nearer surface by primary pixels at about the same depth on both sides of
@@ -360,16 +376,27 @@ bool Enclosed(uint2 p) {
 // length away, its sides are seen by one eye only): its real surface rather than lines of its
 // neighbours drawn across. Outside it the fill's held thing stays out (a ghost of the gun where the
 // hand was a frame ago).
+// Outside it, too, where the primary's eye does not see the point gone (not PAST): a gun raised to
+// the eyes to aim is seen down its barrel by one eye and from the side by the other, its side to
+// that eye only (the warp leaves hundreds of pixels there, beyond any reach), which the eye's own
+// frame alone shows. Where the hand moved since, that eye sees what was behind it: never then.
 bool HeldInside(uint2 p, uint fill) {
-    return HeldMoved(fill) && Enclosed(p) && !Gone(p, fill);
+    if (!HeldMoved(fill)) return false;
+    return Enclosed(p) ? !Gone(p, fill) : Seen(p, fill) != PAST;
 }
 
 // Whether the fill's pixel at `p` (key `fill`) goes out over the primary's (key `primary`): the
 // same surface with FillFirst, or a clearly nearer one the primary's eye could not see (hidden).
+// A held thing of the fill (HeldMoved, not trusted everywhere) goes over a clearly farther primary
+// pixel that the primary's eye does not see gone: the side of a gun aimed down, which that eye sees
+// edge-on, lands in the warp as pixels far apart with what is behind showing between them.
+// With FillFirst the same surface takes the fill only where its colour agrees with the primary
+// around it (Agrees): a walking character's last place keeps its depth but not its colour.
 bool FillOver(uint2 p, uint fill, uint primary) {
-    if (!fill || Held(fill)) return false;
-    if (FillFirst && SameSurface(fill, primary)) return true;
+    if (!fill) return false;
     uint nf = Nearness(fill), np = Nearness(primary);
+    if (Held(fill)) return HeldMoved(fill) && np + nf / 8 < nf && Seen(p, fill) != PAST;
+    if (FillFirst && SameSurface(fill, primary) && Agrees(p)) return true;
     return np + nf / 8 < nf && Seen(p, fill) == HIDDEN;
 }
 

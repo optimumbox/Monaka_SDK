@@ -211,6 +211,45 @@ fn held_things_in_the_eyes_own_frame_move_with_the_play_space() {
 }
 
 #[test]
+fn held_things_of_the_eyes_own_frame_fill_where_the_other_eye_does_not_see_them_gone() {
+    // As above, but the held things not trusted everywhere (Wolfenstein): a gun raised to aim, seen
+    // down its barrel by the real eye, has a side that eye cannot see, wider than any reach about
+    // its own held pixels. The gap beside the box is where the eye's own frame saw its held thing
+    // (0.8 m) and the real eye sees the box (0.5 m) in front of that point: the held thing. Where the
+    // real eye sees the wall through that point (the hand moved off it since), the wall.
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (64u32, 8u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let (box_columns, wall, near) = (24..36u32, [255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+    let depth: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| at(if box_columns.contains(&x) { 0.5 } else { 2.0 }).to_le_bytes())).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth);
+    let colours: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| if box_columns.contains(&x) { near } else { wall })).collect();
+    let this = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &colours);
+    let held_depth: Vec<u8> = (0..w * h).flat_map(|_| at(0.8).to_le_bytes()).collect();
+    let held_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &held_depth);
+    let green: Vec<u8> = (0..w * h).flat_map(|_| [0, 255, 0, 255]).collect();
+    let last = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &green);
+    let camera = |x: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] };
+    let primary = reprojector.capture(&context, &this, &depth, projection, camera(0.0), None).unwrap();
+    let fill = reprojector.capture(&context, &last, &held_depth, projection, camera(0.0), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(0.1), mapping, width: w, height: h };
+    reprojector.held_reach = 0.9;
+    reprojector.fill_held_camera = Some(camera(0.1));
+    reprojector.fill_held_trusted = false;
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    let pixel = |x: u32| read_pixel(&device, &context, &image, x, 3).unwrap();
+    for x in 30..32 {
+        assert_eq!(pixel(x), [0, 255, 0, 170], "column {x}: the held thing the real eye sees hidden behind the box");
+    }
+    assert_eq!(pixel(50), [wall[0], wall[1], wall[2], 255], "the wall the real eye sees through the held thing's old place");
+}
+
+#[test]
 fn a_hole_the_real_eye_could_not_see_in_a_surface_comes_from_the_eyes_own_frame() {
     // A bar 1 m away in front of a wall 4 m away; in the real eye something 0.25 m away hides the
     // bar's middle rows, but not the wall just left of it. The other eye 0.25 m to the right sees

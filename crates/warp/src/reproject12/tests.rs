@@ -122,11 +122,16 @@ fn other_eye_from_this_frame_and_gaps_from_its_own_last_frame() {
     // Without a fill frame, the gap continues its neighbour instead.
     run(&mut reprojector, &primary, None, &targets);
     assert_eq!(pixel(&queue, &out, 55, 3), [63 * 4, 0, 0, 85]);
-    // The fill first: the right eye's own last frame shows the same wall everywhere, so it goes out
-    // in place of the warped left eye; a fill of a nearer surface would not.
+    // The fill first: the right eye's own last frame shows the same wall in about the same colour
+    // (its own shading of it), so it goes out in place of the warped left eye; in another colour
+    // (something moved off the wall since), or of a nearer surface, it would not.
     reprojector.fill_first = true;
     run(&mut reprojector, &primary, Some(&fill), &targets);
-    assert_eq!(pixel(&queue, &out, 20, 3), [0, 255, 0, 170], "the eye's own frame where the surface agrees");
+    assert_eq!(pixel(&queue, &out, 20, 3), [36 * 4, 0, 0, 255], "the warp where the fill's colour differs");
+    let shade: Vec<u8> = (0..w * h).flat_map(|_| [140, 0, 0, 255]).collect();
+    let shade = upload(&device, &queue, (w, h), DXGI_FORMAT_R8G8B8A8_UNORM, &shade);
+    run(&mut reprojector, &primary, Some(&Source { color: &shade, ..fill }), &targets);
+    assert_eq!(pixel(&queue, &out, 20, 3), [140, 0, 0, 170], "the eye's own frame where the surface agrees");
     let nearer: Vec<u8> = (0..(w / 2) * (h / 2)).flat_map(|_| (near / 1.5).to_le_bytes()).collect();
     let nearer = upload(&device, &queue, (w / 2, h / 2), DXGI_FORMAT_R32_TYPELESS, &nearer);
     run(&mut reprojector, &primary, Some(&Source { depth: &nearer, ..fill }), &targets);
