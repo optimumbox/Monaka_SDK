@@ -180,14 +180,14 @@ uint Seen(uint2 p, uint fill) {
 // A crack: a target pixel no source pixel landed on inside one of the primary's surfaces (a surface
 // drawn larger than in its source, nearer or turned toward this eye, leaves such pixels in a grid).
 // Told from a gap beside a nearer surface by primary pixels at about the same depth on both sides of
-// it within two pixels, along a row, a column or a diagonal; a gap has the nearer surface on one side
-// only. The nearest such pixel, or (-1, -1).
-int2 Crack(uint2 p) {
+// it within `reach` pixels, along a row, a column or a diagonal; a gap has the nearer surface on one
+// side only. The nearest such pixel, or (-1, -1).
+int2 CrackWithin(uint2 p, int reach) {
     const int2 dirs[4] = { int2(1, 0), int2(0, 1), int2(1, 1), int2(1, -1) };
     uint best_near = 0; int2 best = int2(-1, -1);
     [unroll] for (int d = 0; d < 4; ++d) {
         uint ka = 0, kb = 0; int2 a = int2(-1, -1), b = int2(-1, -1);
-        [unroll] for (int r = 1; r <= 2; ++r) {
+        [loop] for (int r = 1; r <= reach; ++r) {
             int2 q = int2(p) + dirs[d] * r, s = int2(p) - dirs[d] * r;
             if (!ka && Inside(q)) { ka = PrimaryKeys.Load(int3(q, 0)); a = q; }
             if (!kb && Inside(s)) { kb = PrimaryKeys.Load(int3(s, 0)); b = s; }
@@ -197,6 +197,21 @@ int2 Crack(uint2 p) {
         if (ka && kb && farther >= nearer - nearer / 5 && nearer > best_near) { best_near = nearer; best = na >= nb ? a : b; }
     }
     return best;
+}
+
+// How far a crack in a held thing (below) is looked across, each way.
+static const int HELD_CRACK_REACH = 8;
+
+// A crack (above) within two pixels anywhere; within the hands' reach (HeldNearness) up to
+// HELD_CRACK_REACH: a held gun a hand's length from the eyes is drawn much larger in the other eye,
+// its landed pixels several apart, and a gap with that surface on both sides is inside it (not
+// beside it), so it takes the surface rather than what is behind (lines drawn across the gun).
+int2 Crack(uint2 p) {
+    int2 crack = CrackWithin(p, 2);
+    if (crack.x >= 0 || HeldNearness <= 0) return crack;
+    crack = CrackWithin(p, HELD_CRACK_REACH);
+    if (crack.x >= 0 && Nearness(PrimaryKeys.Load(int3(crack, 0))) / NEARNESS_STEPS > HeldNearness) return crack;
+    return int2(-1, -1);
 }
 
 // How far a hole (below) is looked across, each way.
