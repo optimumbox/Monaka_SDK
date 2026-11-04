@@ -480,6 +480,8 @@ impl Warping {
                 dll_dirs: vec![fsr.dlls.to_path_buf()],
                 jitter_sign: fsr.jitter_sign,
                 sharpness: fsr.sharpness,
+                // The hands and what they hold from the frame, as the warp treats them.
+                held_reach: f32::from(self.warp.rules.held_reach_cm) / 100.0,
             };
             match Dlss11::new(&self.device, &self.context, settings) {
                 Ok(made) => {

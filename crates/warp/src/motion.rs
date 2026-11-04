@@ -26,6 +26,9 @@ struct Constants {
     has_object: u32,
     flags: u32,
     linear: [f32; 4],
+    /// The depth a point the hands' reach away has, and which way is nearer (1 larger, -1 smaller;
+    /// 0: no reach), then padding.
+    held: [f32; 4],
 }
 
 /// One eye's camera for a frame: canonical camera-to-world and the depth buffer's projection.
@@ -47,6 +50,21 @@ pub struct ObjectMotion<'a> {
 pub struct Moved<'a> {
     pub previous_depth: Option<&'a ID3D11ShaderResourceView>,
     pub mask: &'a ID3D11UnorderedAccessView,
+    /// Within this many metres of the eye everything counts as moved on its own (0: none): the
+    /// hands, the arms and what they hold move with the controllers, not the world, so the camera's
+    /// motion is wrong for all of them, and the depth test alone misses a gun shifted across its
+    /// own surface (its depth at the old place the same).
+    pub held_reach: f32,
+}
+
+/// The depth at `reach` metres before an eye drawn with `projection`, and which way is nearer
+/// (`motion.hlsl`'s Held); none without a reach or a perspective projection.
+fn held_depth(projection: &Mat44, reach: f32) -> [f32; 4] {
+    let p = projection;
+    match reach > 0.0 && p[11].is_finite() && p[11] != 0.0 {
+        true => [-p[10] + p[11] / reach, p[11].signum(), 0.0, 0.0],
+        false => [0.0; 4],
+    }
 }
 
 pub struct MotionPass {
@@ -141,6 +159,7 @@ impl MotionPass {
             has_object: u32::from(object_view.is_some()),
             flags,
             linear: [p[10], p[11], p[14], p[15]],
+            held: moved.as_ref().map_or([0.0; 4], |m| held_depth(&current.projection, m.held_reach)),
         };
         let saved = SavedCompute::take(context);
         // SAFETY: copies the game's depth into our same-shaped typeless copy.

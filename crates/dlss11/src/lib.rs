@@ -159,6 +159,9 @@ pub struct Settings {
     pub jitter_sign: f32,
     /// CAS sharpening 0..1 after DLSS, or none.
     pub sharpness: Option<f32>,
+    /// Within this many metres of the eye, pixels are taken from the frame rather than history
+    /// (`monaka_warp::Moved::held_reach`; 0: none): the hands and what they hold.
+    pub held_reach: f32,
 }
 
 /// One eye's frame.
@@ -371,7 +374,7 @@ impl Dlss11 {
         }
         let state = &mut self.eyes[eye];
         let previous = if frame.reset { None } else { state.previous };
-        let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1 };
+        let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1, held_reach: self.settings.held_reach };
         self.motion
             .run_moved(context, &self.depth_in, &frame.view, previous.as_ref(), None, &self.motion_vectors.1, &self.depth.1, Some(moved), render)
             .map_err(|e| Error::Failed(format!("motion vectors: {e}")))?;
@@ -463,7 +466,7 @@ mod tests {
         let (device, context, _) = d3d::create_device(None).expect("device");
         let display = (512, 512);
         let render = render_size(display, Quality::Quality);
-        let settings = Settings { render, display, quality: Quality::Quality, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0, sharpness: Some(0.5) };
+        let settings = Settings { render, display, quality: Quality::Quality, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0, sharpness: Some(0.5), held_reach: 0.0 };
         let mut dlss = Dlss11::new(&device, &context, settings).expect("DLSS");
         let frame = (render.0 * 2, render.1);
         let colour_desc = D3D11_TEXTURE2D_DESC { BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32, ..d3d::simple_texture_desc(frame.0, frame.1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) };

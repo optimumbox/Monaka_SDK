@@ -9,7 +9,8 @@
 // depth, Flags bit 1, compared as distance along the view, the nearest of 3x3 texels), so the
 // camera's motion vector is wrong for it (an enemy walking, the gun in a moving hand). 1 there,
 // 0 where the camera's motion explains it; an upscaler then takes such pixels from this frame
-// rather than smearing its history over them.
+// rather than smearing its history over them. Everything within the hands' reach (Held) is marked
+// too: a gun moved across its own surface keeps its depth at the old place, so the test misses it.
 cbuffer Motion : register(b0) {
     row_major float4x4 M;
     uint W, H;                // render size (the vectors' and depth output's)
@@ -18,6 +19,7 @@ cbuffer Motion : register(b0) {
     uint HasObject;
     uint Flags;               // bit 0: write the mask; bit 1: the previous depth is there
     float4 Linear;            // the previous projection's z row terms: P[2][2], P[2][3], P[3][2], P[3][3]
+    float4 Held;              // the depth the hands' reach away, and which way is nearer (y: 1, -1; 0 none)
 };
 Texture2D<float> Depth : register(t0);
 Texture2D<float2> Object : register(t1);
@@ -65,6 +67,8 @@ float Along(float d) {
                 moved = saturate((best - 0.04) / 0.08);
             }
         }
+        // Within the hands' reach: moved with the controllers, whatever the depth test says.
+        if (Held.y != 0 && Held.y * (d - Held.x) > 0) moved = 1;
         Moved[id.xy] = moved;
     }
 }

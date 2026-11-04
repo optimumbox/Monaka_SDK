@@ -721,6 +721,7 @@ impl State {
                 dll_dirs: vec![dlss.dlls.to_path_buf()],
                 jitter_sign: dlss.jitter_sign,
                 sharpness: dlss.sharpness,
+                held_reach: 0.0,
             };
             match Dlss11::new(&device, context, settings) {
                 Ok(made) => {
