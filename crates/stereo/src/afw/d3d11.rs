@@ -76,6 +76,8 @@ pub struct Afw11 {
     /// The head pose each eye's kept frame was drawn for (its held camera, [`held_camera`]).
     frame_poses: [Option<HeadPose>; 2],
     held_logged: u32,
+    /// [`Rules::held_fill`].
+    held_fill: bool,
     writer: LazyProducer11,
     shown: Option<ID3D11Texture2D>,
     /// Each eye's last frame as presented, for a plain pair (its pose and present are the core's).
@@ -201,6 +203,7 @@ impl Afw11 {
             snapshots: Snapshots::default(),
             frame_poses: [None, None],
             held_logged: 0,
+            held_fill: rules.held_fill,
             tally: Tally::NEW,
             fill_apart: 0.0,
             gaps_logged: 0,
@@ -418,7 +421,7 @@ impl Afw11 {
             }
         }
         let target = warp.target.view(desc.Width, desc.Height);
-        self.reprojector.fill_held_camera = fill.zip(self.frame_poses[other]).and_then(|(fill, then)| held_camera(&fill.camera, &then, &warp.target.camera, &shot.pose));
+        self.reprojector.fill_held_camera = fill.filter(|_| self.held_fill).zip(self.frame_poses[other]).and_then(|(fill, then)| held_camera(&fill.camera, &then, &warp.target.camera, &shot.pose));
         if let Some(held) = self.reprojector.fill_held_camera.filter(|_| self.held_logged < 8)
             && let Some(fill) = fill
         {

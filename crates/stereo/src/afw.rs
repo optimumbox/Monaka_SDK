@@ -184,15 +184,20 @@ pub struct Rules {
     /// Centimetres from the eye within which the eye's own last frame never fills (0: none): the
     /// hands and what they hold, which it shows where they were (`monaka_warp::Reprojector::held_reach`).
     pub held_reach_cm: u16,
+    /// Within that reach the eye's own last frame fills after all, its held things moved with the
+    /// play space (`monaka_warp::Reprojector::fill_held_camera`, D3D11). That frame is a moment
+    /// older than the warp's: a hand that moved since puts its gun there beside the warped one (a
+    /// ghost gun). Without, the gaps there take what is behind them, from the same moment.
+    pub held_fill: bool,
 }
 
 impl Rules {
     /// Every rule: an old frame (from before a pause or a cut) fills nothing, menus go flat, a
     /// frame not warped still goes out, the eye's own frame first.
-    pub const WHOLE: Self = Self { fill_age: Some(4), flat_frames: true, plain_pairs: true, fill_first: true, held_reach_cm: 0 };
+    pub const WHOLE: Self = Self { fill_age: Some(4), flat_frames: true, plain_pairs: true, fill_first: true, held_reach_cm: 0, held_fill: true };
     /// Warped pairs only: the other eye's newest frame fills whatever its age, and a frame not
     /// warped (a menu, a loading screen, no depth) publishes nothing.
-    pub const WARPED_ONLY: Self = Self { fill_age: None, flat_frames: false, plain_pairs: false, fill_first: false, held_reach_cm: 0 };
+    pub const WARPED_ONLY: Self = Self { fill_age: None, flat_frames: false, plain_pairs: false, fill_first: false, held_reach_cm: 0, held_fill: true };
 
     /// These rules on a schedule that renders one eye `refresh` presents in a row: that eye's frames
     /// fill the other eye's gaps for that long.
@@ -213,6 +218,12 @@ impl Rules {
     /// These rules with the eye's own frame never filling within `cm` centimetres of the eye.
     pub const fn held_reach(self, cm: u16) -> Self {
         Self { held_reach_cm: cm, ..self }
+    }
+
+    /// These rules with the held things of the eye's own last frame filling within the reach, or
+    /// not ([`Rules::held_fill`]).
+    pub const fn held_fill(self, on: bool) -> Self {
+        Self { held_fill: on, ..self }
     }
 }
 
