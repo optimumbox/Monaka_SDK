@@ -547,6 +547,8 @@ impl FenceProducer {
         if !dimensions_ok(width, height) || !fence_format_ok(format.0 as u32) {
             return Err(Error::Incompatible("eye size or format"));
         }
+        // The viewer's copy ahead of the game's GPU work (`priority::yield_to_viewer`).
+        crate::priority::yield_to_viewer();
         // SAFETY: COM queries on live objects; creation calls with valid descriptors.
         unsafe {
             if queue.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {

@@ -409,7 +409,7 @@ impl LazyProducer11 {
         if self.producer.is_none() {
             match FenceProducer11::create_with(&self.channel, device, width, height, format, self.mono) {
                 Ok(producer) => {
-                    note = Some(format!("GPU channel {} created at {width}x{height} format {}", self.channel.as_str(), format.0));
+                    note = Some(format!("GPU channel {} created at {width}x{height} format {}; the game's GPU work scheduled {}", self.channel.as_str(), format.0, crate::priority::yield_to_viewer()));
                     self.producer = Some(producer);
                 }
                 Err(e) => {
