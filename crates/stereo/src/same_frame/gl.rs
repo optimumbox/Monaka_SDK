@@ -655,6 +655,9 @@ impl State {
             if let Some(rate) = PAIRS.settings().and_then(|s| s.rate) {
                 rate();
             }
+            if let Some(report) = self.upscaler.as_mut().map(Dlss11::report).filter(|r| !r.is_empty()) {
+                log!("{report}");
+            }
             let timing = PAIRS.timing_report();
             if !timing.is_empty() {
                 log!("{timing}");
