@@ -760,6 +760,12 @@ impl State {
             let part = D3D11_BOX { left, top: 0, front: 0, right: left + render.0, bottom: render.1, back: 1 };
             let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut, items: drawn.items };
             match self.upscaler.as_mut()?.upscale(context, eye, &frame) {
+                // The left eye's DLSS sent to the GPU on its own: one long job for both eyes held
+                // the viewer's work behind it for about 2 ms, two halves hold it about 1 ms.
+                Ok(out) if eye == 0 => {
+                    eyes.push(out);
+                    d3d::flush(context);
+                }
                 Ok(out) => eyes.push(out),
                 Err(e) => {
                     if self.dlss_failures < 5 {
