@@ -378,6 +378,9 @@ impl Warping {
             if let Some(afw) = self.afw.as_ref() {
                 log!("{}", afw.report_line());
             }
+            if let Some(report) = self.dlss.as_mut().map(Dlss11::report).filter(|r| !r.is_empty()) {
+                log!("{report}");
+            }
             let timing = PAIRS.timing_report();
             if !timing.is_empty() {
                 log!("{timing}");

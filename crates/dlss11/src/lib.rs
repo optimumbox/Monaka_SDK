@@ -24,7 +24,7 @@ use monaka_warp::{EyeView, MotionPass, Moved, SharpenPass};
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
     ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -32,6 +32,25 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32_FLOAT,
 };
 use windows::core::Interface;
+
+/// The moved mask's share of each eye, read back now and then without waiting, apart for a head
+/// standing still and one walking (for the log: where DLSS was told to take this frame's colour
+/// rather than its history, it shows the render size).
+struct Probe {
+    staging: [ID3D11Texture2D; 2],
+    /// A copy waiting to be read, and whether the camera was walking then.
+    pending: [Option<bool>; 2],
+    calls: [u64; 2],
+    /// The share's sum and the count, for [still, walking] by eye.
+    shares: [[(f64, u32); 2]; 2],
+    resets: u64,
+}
+
+/// Camera travel a frame (metres) above which the eye counts as walking, and below which as still.
+const WALKING: f32 = 0.006;
+const STILL: f32 = 0.0015;
+/// Each eye's mask is copied for reading every this many of its frames.
+const PROBE_EVERY: u64 = 30;
 
 /// The project id NGX is opened with (a custom engine has no NVIDIA application id).
 const PROJECT_ID: &CStr = c"8f4d6c2a-31b7-4e0d-9a5c-6e2b1f7d40a9";
@@ -206,6 +225,7 @@ pub struct Dlss11 {
     /// Where pixels moved on their own (render size, shared by both eyes like the inputs).
     moved: (ID3D11Texture2D, ID3D11UnorderedAccessView),
     eyes: Vec<Eye>,
+    probe: Option<Probe>,
 }
 
 // SAFETY: used under its owner's lock on the game's render thread.
@@ -313,7 +333,15 @@ impl Dlss11 {
             None => None,
         };
         let motion = MotionPass::new(device).map_err(|e| Error::Failed(format!("motion pass: {e}")))?;
-        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, moved, eyes: Vec::new() };
+        let staging = || {
+            let mut desc = d3d::simple_texture_desc(render.0, render.1, DXGI_FORMAT_R8_UNORM);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            d3d::create_texture(device, &desc).ok()
+        };
+        let probe = staging().zip(staging()).map(|(a, b)| Probe { staging: [a, b], pending: [None; 2], calls: [0; 2], shares: [[(0.0, 0); 2]; 2], resets: 0 });
+        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, moved, eyes: Vec::new(), probe };
         for _ in 0..2 {
             let output = with_uav(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?;
             let upscaled = match this.sharpen {
@@ -380,6 +408,13 @@ impl Dlss11 {
             .map_err(|e| Error::Failed(format!("motion vectors: {e}")))?;
         // SAFETY: copies between two of our own same-shaped R32 textures on our context.
         unsafe { context.CopyResource(&state.previous_depth.0, &self.depth.0) };
+        if let Some(probe) = self.probe.as_mut() {
+            let travel = previous.map(|p| {
+                let (a, b) = (p.camera, frame.view.camera);
+                ((a[3] - b[3]).powi(2) + (a[7] - b[7]).powi(2) + (a[11] - b[11]).powi(2)).sqrt()
+            });
+            probe.look(context, eye.min(1), &self.moved.0, travel, render);
+        }
         let p = self.parameters;
         let sign = self.settings.jitter_sign;
         let resource = |t: &ID3D11Texture2D| t.as_raw() as *mut c_void;
@@ -419,6 +454,75 @@ impl Dlss11 {
         }
         state.previous = Some(frame.view);
         Ok(state.output.0.clone())
+    }
+}
+
+impl Dlss11 {
+    /// The moved mask's share of each eye since the last report, standing still and walking, and
+    /// the histories reset; empty without a probe.
+    pub fn report(&mut self) -> String {
+        let Some(probe) = self.probe.as_mut() else { return String::new() };
+        let part = |(sum, count): (f64, u32)| if count == 0 { "-".to_owned() } else { format!("{:.1}%", 100.0 * sum / f64::from(count)) };
+        let line = format!(
+            "DLSS: the moved mask (this frame's colour, not the history) covered, standing still: left {} right {} ({} looks); walking: left {} right {} ({} looks); {} histories reset",
+            part(probe.shares[0][0]),
+            part(probe.shares[1][0]),
+            probe.shares[0][0].1 + probe.shares[1][0].1,
+            part(probe.shares[0][1]),
+            part(probe.shares[1][1]),
+            probe.shares[0][1].1 + probe.shares[1][1].1,
+            probe.resets
+        );
+        probe.shares = [[(0.0, 0); 2]; 2];
+        probe.resets = 0;
+        line
+    }
+}
+
+impl Probe {
+    /// Eye `eye`'s mask just written: the copy waiting read if the GPU is done with it, and a new
+    /// one made every [`PROBE_EVERY`] frames the camera stands still or walks (`travel`: metres
+    /// since the eye's previous frame; none on a reset).
+    fn look(&mut self, context: &ID3D11DeviceContext, eye: usize, mask: &ID3D11Texture2D, travel: Option<f32>, render: (u32, u32)) {
+        let Some(travel) = travel else {
+            self.resets += 1;
+            return;
+        };
+        if let Some(walking) = self.pending[eye] {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            // SAFETY: our staging texture, mapped for reading without waiting; read within its
+            // pitch and unmapped at once.
+            unsafe {
+                if context.Map(&self.staging[eye], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut mapped)).is_ok() {
+                    let mut marked = 0u64;
+                    for y in 0..render.1 as usize {
+                        let row = std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize), render.0 as usize);
+                        marked += row.iter().filter(|&&v| v >= 128).count() as u64;
+                    }
+                    context.Unmap(&self.staging[eye], 0);
+                    let share = marked as f64 / (f64::from(render.0) * f64::from(render.1));
+                    let slot = &mut self.shares[eye][usize::from(walking)];
+                    slot.0 += share;
+                    slot.1 += 1;
+                    self.pending[eye] = None;
+                }
+            }
+            return;
+        }
+        self.calls[eye] += 1;
+        let walking = if travel > WALKING {
+            true
+        } else if travel < STILL {
+            false
+        } else {
+            return;
+        };
+        if self.calls[eye] >= PROBE_EVERY {
+            self.calls[eye] = 0;
+            // SAFETY: copies our mask into our staging texture of its shape, on our context.
+            unsafe { context.CopyResource(&self.staging[eye], mask) };
+            self.pending[eye] = Some(walking);
+        }
     }
 }
 
