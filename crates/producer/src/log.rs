@@ -41,8 +41,28 @@ struct Out {
     written: u64,
 }
 
+/// Moves a log at `path` aside to the first free `stem-N.ext` (best effort).
+fn keep_earlier(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 1..100 {
+        let aside = path.with_file_name(format!("{stem}-{n}{ext}"));
+        if !aside.exists() {
+            let _ = std::fs::rename(path, aside);
+            return;
+        }
+    }
+}
+
 impl LogFile {
+    /// A log already at `path` (the pack loaded again in the same run: VR restarted in the game
+    /// with new settings) is kept beside it as `name-1.log`, `name-2.log`, ...: the run before the
+    /// restart is what was being tested.
     pub fn create(path: &Path, scrub: Scrub) -> io::Result<Self> {
+        keep_earlier(path);
         let out = Out { file: File::create(path)?, spare: Vec::with_capacity(64 * 1024), scrubbed: Vec::with_capacity(64 * 1024), scrub, written: 0 };
         Ok(Self { pending: Mutex::new(Vec::with_capacity(64 * 1024)), out: Mutex::new(out), started: Instant::now() })
     }

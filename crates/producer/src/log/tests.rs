@@ -117,3 +117,15 @@ fn the_log_counts_what_it_wrote() {
     log.write_pending();
     assert_eq!(log.written(), std::fs::metadata(&path).unwrap().len());
 }
+
+#[test]
+fn a_log_opened_again_keeps_the_earlier_one_beside_it() {
+    let path = log_path();
+    std::fs::write(&path, "before the restart\n").unwrap();
+    let again = LogFile::create(&path, Scrub::for_profile(None)).unwrap();
+    drop(again);
+    let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+    let aside = path.with_file_name(format!("{stem}-1.log"));
+    assert_eq!(std::fs::read_to_string(&aside).unwrap(), "before the restart\n");
+    assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+}
