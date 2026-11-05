@@ -479,6 +479,7 @@ impl Warping {
                 render,
                 display,
                 quality: dlss.quality,
+                preset: dlss.preset,
                 data_dir: dlss.data.to_path_buf(),
                 dll_dirs: vec![fsr.dlls.to_path_buf()],
                 jitter_sign: fsr.jitter_sign,
@@ -488,7 +489,7 @@ impl Warping {
             };
             match Dlss11::new(&self.device, &self.context, settings) {
                 Ok(made) => {
-                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), render.0, render.1, display.0, display.1, fsr.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
+                    log!("DLSS {} (preset {}): {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), dlss.preset.name(), render.0, render.1, display.0, display.1, fsr.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
                     self.dlss = Some(made);
                     self.fsr_last = [None, None];
                 }

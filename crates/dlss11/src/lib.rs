@@ -112,6 +112,56 @@ impl Quality {
     }
 }
 
+/// The DLSS model (NVIDIA's render preset), the same at every [`Quality`]. E and F are the older
+/// CNN model, cheaper on the GPU; J and K the transformer model (DLSS 4), L and M its second
+/// generation (DLSS 4.5). A DLSS version without the preset falls back to its own default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    E,
+    F,
+    J,
+    K,
+    L,
+    M,
+}
+
+impl Preset {
+    pub const ALL: [Self; 6] = [Self::E, Self::F, Self::J, Self::K, Self::L, Self::M];
+
+    /// `e`, `f`, `j`, `k`, `l` or `m` (either case).
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.name().eq_ignore_ascii_case(text.trim()))
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::E => "E",
+            Self::F => "F",
+            Self::J => "J",
+            Self::K => "K",
+            Self::L => "L",
+            Self::M => "M",
+        }
+    }
+
+    /// Whether this is the older CNN model rather than a transformer.
+    pub fn cnn(self) -> bool {
+        matches!(self, Self::E | Self::F)
+    }
+
+    /// `NVSDK_NGX_DLSS_Hint_Render_Preset` (A is 1).
+    fn value(self) -> u32 {
+        match self {
+            Self::E => 5,
+            Self::F => 6,
+            Self::J => 10,
+            Self::K => 11,
+            Self::L => 12,
+            Self::M => 13,
+        }
+    }
+}
+
 /// The size each eye is rendered at for an eye of `display` at `quality` (even sides).
 pub fn render_size(display: (u32, u32), quality: Quality) -> (u32, u32) {
     let side = |n: u32| ((n as f32 * quality.scale() / 2.0).round() as u32 * 2).max(2);
@@ -172,6 +222,8 @@ pub struct Settings {
     /// The size each eye is upscaled to.
     pub display: (u32, u32),
     pub quality: Quality,
+    /// The DLSS model.
+    pub preset: Preset,
     /// A folder NGX may write its logs and cache into.
     pub data_dir: PathBuf,
     /// Where to look for `nvngx_dlss.dll`, first to last.
@@ -374,6 +426,9 @@ impl Dlss11 {
             ngx::NVSDK_NGX_Parameter_SetUI(p, c"OutWidth".as_ptr(), s.display.0);
             ngx::NVSDK_NGX_Parameter_SetUI(p, c"OutHeight".as_ptr(), s.display.1);
             ngx::NVSDK_NGX_Parameter_SetI(p, c"PerfQualityValue".as_ptr(), s.quality.value());
+            for mode in [c"DLSS.Hint.Render.Preset.DLAA", c"DLSS.Hint.Render.Preset.Quality", c"DLSS.Hint.Render.Preset.Balanced", c"DLSS.Hint.Render.Preset.Performance", c"DLSS.Hint.Render.Preset.UltraPerformance", c"DLSS.Hint.Render.Preset.UltraQuality"] {
+                ngx::NVSDK_NGX_Parameter_SetUI(p, mode.as_ptr(), s.preset.value());
+            }
             ngx::NVSDK_NGX_Parameter_SetI(p, c"DLSS.Feature.Create.Flags".as_ptr(), ngx::DLSS_MV_LOW_RES);
             ngx::NVSDK_NGX_Parameter_SetI(p, c"DLSS.Enable.Output.Subrects".as_ptr(), 0);
             ngx_call("creating the DLSS feature", ngx::NVSDK_NGX_D3D11_CreateFeature(context.as_raw(), ngx::FEATURE_SUPER_SAMPLING, p, &mut handle))?;
@@ -579,7 +634,7 @@ mod tests {
         let (device, context, _) = d3d::create_device(None).expect("device");
         let display = (512, 512);
         let render = render_size(display, Quality::Quality);
-        let settings = Settings { render, display, quality: Quality::Quality, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0, sharpness: Some(0.5), held_reach: 0.0 };
+        let settings = Settings { render, display, quality: Quality::Quality, preset: Preset::K, data_dir: std::env::temp_dir().join("monaka_dlss_test"), dll_dirs: vec![dir], jitter_sign: 1.0, sharpness: Some(0.5), held_reach: 0.0 };
         let mut dlss = Dlss11::new(&device, &context, settings).expect("DLSS");
         let frame = (render.0 * 2, render.1);
         let colour_desc = D3D11_TEXTURE2D_DESC { BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32, ..d3d::simple_texture_desc(frame.0, frame.1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) };
@@ -605,5 +660,9 @@ mod tests {
             assert!(Quality::parse(name).is_some(), "{name}");
         }
         assert_eq!(Quality::parse("ultra"), None);
+        assert_eq!(Preset::parse("k"), Some(Preset::K));
+        assert_eq!(Preset::parse(" E "), Some(Preset::E));
+        assert_eq!(Preset::parse("a"), None);
+        assert!(Preset::E.cnn() && !Preset::K.cnn());
     }
 }

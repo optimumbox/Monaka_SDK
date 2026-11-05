@@ -106,6 +106,7 @@ pub struct GlFsr {
 #[derive(Clone, Copy, Debug)]
 pub struct GlFsrDlss {
     pub quality: Quality,
+    pub preset: monaka_dlss11::Preset,
     /// A folder NGX may write into.
     pub data: &'static Path,
 }
@@ -114,6 +115,8 @@ pub struct GlFsrDlss {
 #[derive(Clone, Copy, Debug)]
 pub struct GlDlss {
     pub quality: Quality,
+    /// The DLSS model.
+    pub preset: monaka_dlss11::Preset,
     /// The eye size each eye is upscaled to (the channel's).
     pub display: (u32, u32),
     /// The frame at this `SwapBuffers`: each eye's camera and unjittered projection and the jitter
@@ -726,6 +729,7 @@ impl State {
                 render,
                 display: dlss.display,
                 quality: dlss.quality,
+                preset: dlss.preset,
                 data_dir: dlss.data.to_path_buf(),
                 dll_dirs: vec![dlss.dlls.to_path_buf()],
                 jitter_sign: dlss.jitter_sign,
@@ -734,7 +738,7 @@ impl State {
             };
             match Dlss11::new(&device, context, settings) {
                 Ok(made) => {
-                    log!("DLSS {}: {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), render.0, render.1, dlss.display.0, dlss.display.1, dlss.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
+                    log!("DLSS {} (preset {}): {}x{} upscaled to {}x{} per eye, sharpness {}", dlss.quality.name(), dlss.preset.name(), render.0, render.1, dlss.display.0, dlss.display.1, dlss.sharpness.map_or("off".to_owned(), |s| format!("{s:.2}")));
                     self.upscaler = Some(made);
                     self.dlss_last = [None, None];
                 }
