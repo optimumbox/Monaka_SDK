@@ -136,3 +136,41 @@ fn whatever_is_within_the_hands_reach_is_masked() {
     assert!(at(2) == 1.0 && at(3) == 1.0, "the gun: {row:?}");
     assert!([0, 1, 4, 5, 6, 7, 9, 12, 15].iter().all(|&x| at(x) == 0.0), "the wall and sky: {row:?}");
 }
+
+/// The camera stands still and the crate of the test above is gone: the wall it hid shows again.
+/// That is the upscaler's own disocclusion, not marked.
+#[test]
+fn a_surface_revealed_is_not_masked() {
+    let (device, context, _) = create_device(None).unwrap();
+    let mut pass = MotionPass::new(&device).unwrap();
+    let (w, h) = (16u32, 4u32);
+    let near = 0.1f32;
+    let mut projection = [0.0f32; 16];
+    projection[0] = 1.0;
+    projection[5] = 1.0;
+    projection[11] = near;
+    projection[14] = -1.0;
+    let (wall, crate_) = (near / 2.0, near / 0.5);
+    let image = |f: &dyn Fn(u32) -> f32| -> Vec<u8> { (0..h).flat_map(|_| (0..w).flat_map(|x| f(x).to_le_bytes()).collect::<Vec<u8>>()).collect() };
+    let before = image(&|x| if x == 2 || x == 3 { crate_ } else if x < w / 2 { wall } else { 0.0 });
+    let now = image(&|x| if x < w / 2 { wall } else { 0.0 });
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, Some(&now));
+    let previous_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, Some(&before));
+    let mut previous_view = None;
+    // SAFETY: test setup on our own texture.
+    unsafe { device.CreateShaderResourceView(&previous_depth, None, Some(&mut previous_view)).unwrap() };
+    let previous_view = previous_view.unwrap();
+    let motion = texture(&device, w, h, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let depth_out = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let mask = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let still: Mat34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let view = EyeView { camera: still, projection };
+    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.0 };
+    pass.run_moved(&context, &depth, &view, Some(&view), None, &uav(&device, &motion), &uav(&device, &depth_out), Some(moved), (w, h)).unwrap();
+    let (_, _, texels) = read_image(&device, &context, &mask).unwrap();
+    let row: Vec<f32> = (0..w).map(|x| {
+        let i = ((2 * w + x) * 4) as usize;
+        f32::from_le_bytes([texels[i], texels[i + 1], texels[i + 2], texels[i + 3]])
+    }).collect();
+    assert!(row.iter().all(|&v| v == 0.0), "{row:?}");
+}

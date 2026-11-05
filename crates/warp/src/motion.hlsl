@@ -9,7 +9,10 @@
 // depth, Flags bit 1, compared as distance along the view, the nearest of 3x3 texels), so the
 // camera's motion vector is wrong for it (an enemy walking, the gun in a moving hand). 1 there,
 // 0 where the camera's motion explains it; an upscaler then takes such pixels from this frame
-// rather than smearing its history over them. Everything within the hands' reach (Held) is marked
+// rather than smearing its history over them. Only what is nearer now than what was there: a
+// surface revealed from behind something (the far side of every edge while walking) is the
+// upscaler's own disocclusion to handle, and marking it showed a tenth to a fifth of each eye at
+// the render size whenever the player walked. Everything within the hands' reach (Held) is marked
 // too: a gun moved across its own surface keeps its depth at the old place, so the test misses it.
 cbuffer Motion : register(b0) {
     row_major float4x4 M;
@@ -56,15 +59,16 @@ float Along(float d) {
                 float expect = Along(previous.z / previous.w);
                 int2 at = int2((p.x * 0.5 + 0.5) * W, (0.5 - p.y * 0.5) * H);
                 float best = 1e9;
+                bool nearer = false;
                 for (int dy = -1; dy <= 1; dy++) {
                     for (int dx = -1; dx <= 1; dx++) {
                         int2 q = clamp(at + int2(dx, dy), int2(0, 0), int2(W - 1, H - 1));
                         float was = Along(PreviousDepth.Load(int3(q, 0)));
                         float off = (was > 1e8 && expect > 1e8) ? 0 : abs(was - expect) / max(min(was, expect), 1e-6);
-                        best = min(best, off);
+                        if (off < best) { best = off; nearer = was > expect; }
                     }
                 }
-                moved = saturate((best - 0.04) / 0.08);
+                moved = nearer ? saturate((best - 0.04) / 0.08) : 0;
             }
         }
         // Within the hands' reach: moved with the controllers, whatever the depth test says.
