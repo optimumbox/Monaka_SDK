@@ -276,6 +276,32 @@ pub fn copy_texture(context: &ID3D11DeviceContext, target: &ID3D11Texture2D, sou
     unsafe { context.CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, None) };
 }
 
+/// Copies one subresource of `source` into one of `target` (a mip of one into another's, say).
+pub fn copy_subresource(context: &ID3D11DeviceContext, target: &ID3D11Texture2D, target_sub: u32, source: &ID3D11Texture2D, source_sub: u32) {
+    // SAFETY: GPU copy between live textures; D3D validates shape compatibility.
+    unsafe { context.CopySubresourceRegion(target, target_sub, 0, 0, 0, source, source_sub, None) };
+}
+
+/// Whether the device makes a texture's mips of `format` itself (`GenerateMips`).
+pub fn makes_mips(device: &ID3D11Device, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    // SAFETY: a plain query on a live device.
+    unsafe { device.CheckFormatSupport(format) }.is_ok_and(|support| support & windows::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT_MIP_AUTOGEN.0 as u32 != 0)
+}
+
+/// A view of the whole of `texture` for sampling (its own format).
+pub fn shader_view(device: &ID3D11Device, texture: &ID3D11Texture2D) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView> {
+    let mut view = None;
+    // SAFETY: a view of a live texture into a local.
+    unsafe { device.CreateShaderResourceView(texture, None, Some(&mut view))? };
+    Ok(view.expect("view created"))
+}
+
+/// Makes the mips below the first of the texture `view` sees from it.
+pub fn make_mips(context: &ID3D11DeviceContext, view: &windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView) {
+    // SAFETY: a GPU operation on a live view (of a texture made to have its mips generated).
+    unsafe { context.GenerateMips(view) };
+}
+
 /// Submits queued GPU work now.
 pub fn flush(context: &ID3D11DeviceContext) {
     // SAFETY: no preconditions.
