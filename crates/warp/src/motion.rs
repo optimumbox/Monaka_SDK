@@ -5,7 +5,7 @@
 
 use crate::{ConstantBuffer, Error, Readable, Result, SavedCompute, compute_shader, depth_formats, readable, shader_view};
 use monaka_channel::d3d;
-use monaka_core::camera::{Mat34, Mat44};
+use monaka_core::camera::{Mat34, Mat44, compose, position, rigid_inverse};
 use monaka_core::depth::reprojection;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16_FLOAT;
@@ -29,6 +29,26 @@ struct Constants {
     /// The depth a point the hands' reach away has, and which way is nearer (1 larger, -1 smaller;
     /// 0: no reach), then padding.
     held: [f32; 4],
+    unproject: [f32; 16],
+    items: [[f32; 16]; 2],
+    item_at: [[f32; 4]; 2],
+}
+
+/// An item in a hand (the gun, with the hand and arm about it): where it was (canonical, metres,
+/// item-to-world) this frame and the eye's previous frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeldItem {
+    pub now: Mat34,
+    pub before: Mat34,
+}
+
+const IDENTITY34: Mat34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+const IDENTITY44: Mat44 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+/// The world now to `previous`'s clip space for what moved with `item`; none if singular.
+fn item_reprojection(item: &HeldItem, previous: &EyeView) -> Option<Mat44> {
+    let moved = compose(&item.before, &rigid_inverse(&item.now));
+    reprojection(&IDENTITY44, &moved, &previous.projection, &previous.camera)
 }
 
 /// One eye's camera for a frame: canonical camera-to-world and the depth buffer's projection.
@@ -55,6 +75,9 @@ pub struct Moved<'a> {
     /// motion is wrong for all of them, and the depth test alone misses a gun shifted across its
     /// own surface (its depth at the old place the same).
     pub held_reach: f32,
+    /// The hands' items (left, right): within the reach, what is nearer each moves with it rather
+    /// than the camera. None of either: all within the reach is masked.
+    pub items: [Option<HeldItem>; 2],
 }
 
 /// The depth at `reach` metres before an eye drawn with `projection`, and which way is nearer
@@ -149,6 +172,21 @@ impl MotionPass {
         let previous_depth = moved.as_ref().and_then(|m| m.previous_depth).filter(|_| previous.is_some()).cloned();
         let flags = u32::from(moved.is_some()) | (u32::from(previous_depth.is_some()) << 1);
         let p = previous.map_or(current.projection, |v| v.projection);
+        let mut items = [[0.0; 16]; 2];
+        let mut item_at = [[0.0; 4]; 2];
+        let unproject = reprojection(&current.projection, &current.camera, &IDENTITY44, &IDENTITY34);
+        if let (Some(moved), Some(previous), Some(_)) = (moved.as_ref().filter(|m| m.held_reach > 0.0), previous, unproject) {
+            for side in 0..2 {
+                if let Some(item) = moved.items[side]
+                    && let Some(m) = item_reprojection(&item, previous)
+                    && m.iter().all(|v| v.is_finite())
+                {
+                    items[side] = m;
+                    let at = position(&item.now);
+                    item_at[side] = [at[0], at[1], at[2], 1.0];
+                }
+            }
+        }
         let constants = Constants {
             m,
             width,
@@ -160,6 +198,9 @@ impl MotionPass {
             flags,
             linear: [p[10], p[11], p[14], p[15]],
             held: moved.as_ref().map_or([0.0; 4], |m| held_depth(&current.projection, m.held_reach)),
+            unproject: unproject.unwrap_or([0.0; 16]),
+            items,
+            item_at,
         };
         let saved = SavedCompute::take(context);
         // SAFETY: copies the game's depth into our same-shaped typeless copy.

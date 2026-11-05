@@ -517,6 +517,7 @@ impl Warping {
             jitter,
             frame_time_ms,
             reset: cut,
+            items: [None; 2],
         };
         match self.dlss.as_mut()?.upscale(&self.context, eye, &frame) {
             Ok(image) => {

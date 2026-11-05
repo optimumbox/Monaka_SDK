@@ -128,6 +128,9 @@ pub struct GlDlss {
     pub jitter_sign: f32,
     /// CAS sharpening 0..1 after DLSS, or none.
     pub sharpness: Option<f32>,
+    /// The hands' reach (metres; 0: none): within it the motion follows the hands' items
+    /// ([`GlDlssFrame::items`]), or without them DLSS takes those pixels from the frame.
+    pub held_reach: f32,
 }
 
 /// A frame's eyes as drawn for DLSS: each eye's camera (canonical, metres) and unjittered
@@ -136,6 +139,9 @@ pub struct GlDlss {
 pub struct GlDlssFrame {
     pub views: [EyeView; 2],
     pub jitter: [f32; 2],
+    /// Where each hand's item (left, right) was as both eyes were drawn (canonical, metres,
+    /// item-to-world), if the controllers placed it.
+    pub items: [Option<monaka_core::camera::Mat34>; 2],
 }
 
 /// The upscaled eye's size in a `width` x `height` frame for `display` (fractions).
@@ -724,7 +730,7 @@ impl State {
                 dll_dirs: vec![dlss.dlls.to_path_buf()],
                 jitter_sign: dlss.jitter_sign,
                 sharpness: dlss.sharpness,
-                held_reach: 0.0,
+                held_reach: dlss.held_reach,
             };
             match Dlss11::new(&device, context, settings) {
                 Ok(made) => {
@@ -748,7 +754,7 @@ impl State {
             self.dlss_last[eye] = Some((now, position));
             let left = eye as u32 * render.0;
             let part = D3D11_BOX { left, top: 0, front: 0, right: left + render.0, bottom: render.1, back: 1 };
-            let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut };
+            let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut, items: drawn.items };
             match self.upscaler.as_mut()?.upscale(context, eye, &frame) {
                 Ok(out) => eyes.push(out),
                 Err(e) => {

@@ -89,7 +89,7 @@ fn what_moved_on_its_own_is_masked_and_the_rest_is_not() {
     let mask = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
     let still: Mat34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     let view = EyeView { camera: still, projection };
-    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.0 };
+    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.0, items: [None; 2] };
     pass.run_moved(&context, &depth, &view, Some(&view), None, &uav(&device, &motion), &uav(&device, &depth_out), Some(moved), (w, h)).unwrap();
     let (_, _, texels) = read_image(&device, &context, &mask).unwrap();
     let at = |x: u32| {
@@ -125,7 +125,7 @@ fn whatever_is_within_the_hands_reach_is_masked() {
     let mask = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
     let still: Mat34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     let view = EyeView { camera: still, projection };
-    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.9 };
+    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.9, items: [None; 2] };
     pass.run_moved(&context, &depth, &view, Some(&view), None, &uav(&device, &motion), &uav(&device, &depth_out), Some(moved), (w, h)).unwrap();
     let (_, _, texels) = read_image(&device, &context, &mask).unwrap();
     let at = |x: u32| {
@@ -165,7 +165,7 @@ fn a_surface_revealed_is_not_masked() {
     let mask = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
     let still: Mat34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     let view = EyeView { camera: still, projection };
-    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.0 };
+    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.0, items: [None; 2] };
     pass.run_moved(&context, &depth, &view, Some(&view), None, &uav(&device, &motion), &uav(&device, &depth_out), Some(moved), (w, h)).unwrap();
     let (_, _, texels) = read_image(&device, &context, &mask).unwrap();
     let row: Vec<f32> = (0..w).map(|x| {
@@ -173,4 +173,52 @@ fn a_surface_revealed_is_not_masked() {
         f32::from_le_bytes([texels[i], texels[i + 1], texels[i + 2], texels[i + 3]])
     }).collect();
     assert!(row.iter().all(|&v| v == 0.0), "{row:?}");
+}
+
+/// The camera stands still and the gun of the test above moves 5 cm right with its hand between
+/// frames. Given the hand's item, the gun's pixels move with it (a tenth of the view's width in NDC
+/// is 1/20 in UV, from the right back to the left) and are not masked: the upscaler keeps its
+/// history on the sights. The wall stays still.
+#[test]
+fn whatever_is_within_the_hands_reach_moves_with_the_hands_item() {
+    let (device, context, _) = create_device(None).unwrap();
+    let mut pass = MotionPass::new(&device).unwrap();
+    let (w, h) = (16u32, 4u32);
+    let near = 0.1f32;
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[11], projection[14]) = (1.0, 1.0, near, -1.0);
+    let (wall, gun) = (near / 2.0, near / 0.5);
+    let frame: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| (if x == 2 || x == 3 { gun } else if x < w / 2 { wall } else { 0.0 }).to_le_bytes()).collect::<Vec<u8>>()).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, Some(&frame));
+    let previous_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, Some(&frame));
+    let mut previous_view = None;
+    // SAFETY: test setup on our own texture.
+    unsafe { device.CreateShaderResourceView(&previous_depth, None, Some(&mut previous_view)).unwrap() };
+    let previous_view = previous_view.unwrap();
+    let motion = texture(&device, w, h, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let depth_out = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let mask = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, None);
+    let at = |x: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -0.5] };
+    let view = EyeView { camera: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], projection };
+    let item = HeldItem { now: at(0.0), before: at(-0.05) };
+    let moved = Moved { previous_depth: Some(&previous_view), mask: &uav(&device, &mask), held_reach: 0.9, items: [None, Some(item)] };
+    pass.run_moved(&context, &depth, &view, Some(&view), None, &uav(&device, &motion), &uav(&device, &depth_out), Some(moved), (w, h)).unwrap();
+    let (_, _, texels) = read_image(&device, &context, &motion).unwrap();
+    let vector = |x: u32| {
+        let i = ((2 * w + x) * 4) as usize;
+        [half::to_f32(u16::from_le_bytes([texels[i], texels[i + 1]])), half::to_f32(u16::from_le_bytes([texels[i + 2], texels[i + 3]]))]
+    };
+    for x in [2, 3] {
+        let [mx, my] = vector(x);
+        assert!((mx + 0.05).abs() < 1e-3 && my.abs() < 1e-3, "the gun at column {x} moved by {mx}, {my}");
+    }
+    let [mx, my] = vector(5);
+    assert!(mx.abs() < 1e-4 && my.abs() < 1e-4, "the wall moved by {mx}, {my}");
+    let (_, _, texels) = read_image(&device, &context, &mask).unwrap();
+    let masked = |x: u32| {
+        let i = ((2 * w + x) * 4) as usize;
+        f32::from_le_bytes([texels[i], texels[i + 1], texels[i + 2], texels[i + 3]])
+    };
+    let row: Vec<f32> = (0..w).map(masked).collect();
+    assert!(row.iter().all(|&m| m == 0.0), "nothing masked: {row:?}");
 }

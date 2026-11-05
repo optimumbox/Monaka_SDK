@@ -20,7 +20,9 @@
 mod ngx;
 
 use monaka_channel::d3d;
-use monaka_warp::{EyeView, MotionPass, Moved, SharpenPass};
+use monaka_warp::{EyeView, HeldItem, MotionPass, Moved, SharpenPass};
+/// A 3x4 item-to-world matrix (canonical, metres).
+type Mat34 = [f32; 12];
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D11::{
@@ -199,6 +201,9 @@ pub struct EyeFrame<'a> {
     pub frame_time_ms: f32,
     /// Drop the eye's history (a cut).
     pub reset: bool,
+    /// Where each hand's item (left, right) was as the eye was drawn (canonical, metres,
+    /// item-to-world), if known: within the hands' reach the motion follows it.
+    pub items: [Option<Mat34>; 2],
 }
 
 struct Eye {
@@ -207,6 +212,8 @@ struct Eye {
     /// With sharpening: what DLSS writes, and a view the sharpening reads it by.
     upscaled: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     previous: Option<EyeView>,
+    /// The hands' items as of the eye's previous frame.
+    previous_items: [Option<Mat34>; 2],
     /// The eye's depth as last written (render size), for the moved mask.
     previous_depth: (ID3D11Texture2D, ID3D11ShaderResourceView),
 }
@@ -350,7 +357,7 @@ impl Dlss11 {
             };
             let handle = this.create_feature(context)?;
             let previous_depth = with_srv(device, render, DXGI_FORMAT_R32_FLOAT)?;
-            this.eyes.push(Eye { handle, output, upscaled, previous: None, previous_depth });
+            this.eyes.push(Eye { handle, output, upscaled, previous: None, previous_items: [None; 2], previous_depth });
         }
         Ok(this)
     }
@@ -402,7 +409,8 @@ impl Dlss11 {
         }
         let state = &mut self.eyes[eye];
         let previous = if frame.reset { None } else { state.previous };
-        let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1, held_reach: self.settings.held_reach };
+        let items = [0, 1].map(|side| Some(HeldItem { now: frame.items[side]?, before: state.previous_items[side]? }));
+        let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1, held_reach: self.settings.held_reach, items };
         self.motion
             .run_moved(context, &self.depth_in, &frame.view, previous.as_ref(), None, &self.motion_vectors.1, &self.depth.1, Some(moved), render)
             .map_err(|e| Error::Failed(format!("motion vectors: {e}")))?;
@@ -453,6 +461,7 @@ impl Dlss11 {
             sharpen.run(context, view, &state.output.1, self.settings.display, sharpness);
         }
         state.previous = Some(frame.view);
+        state.previous_items = frame.items;
         Ok(state.output.0.clone())
     }
 }
@@ -581,7 +590,7 @@ mod tests {
         for n in 0..4u32 {
             let eye = (n % 2) as usize;
             let part = D3D11_BOX { left: eye as u32 * render.0, top: 0, front: 0, right: (eye as u32 + 1) * render.0, bottom: render.1, back: 1 };
-            let frame = EyeFrame { color: &colour, color_box: part, depth: &depth, depth_box: part, view, jitter: jitter(n), frame_time_ms: 11.0, reset: n < 2 };
+            let frame = EyeFrame { color: &colour, color_box: part, depth: &depth, depth_box: part, view, jitter: jitter(n), frame_time_ms: 11.0, reset: n < 2, items: [None; 2] };
             let out = dlss.upscale(&context, eye, &frame).expect("upscale");
             let desc = d3d::texture_desc(&out);
             assert_eq!((desc.Width, desc.Height), display);

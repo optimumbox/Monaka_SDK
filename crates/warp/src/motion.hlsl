@@ -14,6 +14,9 @@
 // upscaler's own disocclusion to handle, and marking it showed a tenth to a fifth of each eye at
 // the render size whenever the player walked. Everything within the hands' reach (Held) is marked
 // too: a gun moved across its own surface keeps its depth at the old place, so the test misses it.
+// With the hands' items given (where each was this frame and the eye's previous one), what is within
+// reach moves with the nearer item instead of the camera: its motion vector follows the hand, the
+// depth test checks it like any other, and an upscaler keeps its history (the gun's sights sharp).
 cbuffer Motion : register(b0) {
     row_major float4x4 M;
     uint W, H;                // render size (the vectors' and depth output's)
@@ -23,7 +26,13 @@ cbuffer Motion : register(b0) {
     uint Flags;               // bit 0: write the mask; bit 1: the previous depth is there
     float4 Linear;            // the previous projection's z row terms: P[2][2], P[2][3], P[3][2], P[3][3]
     float4 Held;              // the depth the hands' reach away, and which way is nearer (y: 1, -1; 0 none)
+    row_major float4x4 Unproject; // this frame's NDC and depth to the world
+    row_major float4x4 Item0;     // the world now to the eye's previous clip space, moved with each hand's item
+    row_major float4x4 Item1;
+    float4 ItemAt0, ItemAt1;      // where each hand's item is now (w: 1; 0 none)
 };
+// How far from an item's origin (its grip) what moves with it reaches, metres.
+static const float ItemReach = 0.7;
 Texture2D<float> Depth : register(t0);
 Texture2D<float2> Object : register(t1);
 RWTexture2D<float2> Motion : register(u0);
@@ -43,6 +52,21 @@ float Along(float d) {
     float d = Depth.Load(int3(id.x * DW / W, id.y * DH / H, 0));
     float2 ndc = float2((id.x + 0.5) / W * 2 - 1, 1 - (id.y + 0.5) / H * 2);
     float4 previous = mul(M, float4(ndc, d, 1));
+    bool held = Held.y != 0 && Held.y * (d - Held.x) > 0;
+    bool carried = false;
+    if (held && (ItemAt0.w > 0 || ItemAt1.w > 0)) {
+        float4 world = mul(Unproject, float4(ndc, d, 1));
+        if (abs(world.w) > 1e-12) {
+            float3 at = world.xyz / world.w;
+            float far0 = ItemAt0.w > 0 ? distance(at, ItemAt0.xyz) : 1e30;
+            float far1 = ItemAt1.w > 0 ? distance(at, ItemAt1.xyz) : 1e30;
+            // An item's own reach: past it (a free hand far from the gun) the pixel stays masked.
+            if (min(far0, far1) < ItemReach) {
+                previous = mul(far0 <= far1 ? Item0 : Item1, float4(at, 1));
+                carried = true;
+            }
+        }
+    }
     float2 mv = float2(0, 0);
     if (previous.w > 1e-6) {
         float2 p = previous.xy / previous.w;
@@ -71,8 +95,9 @@ float Along(float d) {
                 moved = nearer ? saturate((best - 0.04) / 0.08) : 0;
             }
         }
-        // Within the hands' reach: moved with the controllers, whatever the depth test says.
-        if (Held.y != 0 && Held.y * (d - Held.x) > 0) moved = 1;
+        // Within the hands' reach without the items' motion: moved with the controllers, whatever
+        // the depth test says.
+        if (held && !carried) moved = 1;
         Moved[id.xy] = moved;
     }
 }
