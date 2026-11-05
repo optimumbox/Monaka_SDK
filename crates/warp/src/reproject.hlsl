@@ -31,8 +31,13 @@
 // writes the target's depth in its own convention (depth = (nearness - NearB) / NearA).
 // The output's alpha says where each pixel came from, in thirds (a 2-bit alpha holds it too): 1 the
 // primary, 2/3 the fill, 1/3 the primary's own neighbour (across a crack or behind a gap), 0
-// nothing. The headset ignores alpha; captures read it. The resolves read the primary's own colour
-// at Color (t0), to tell a fill point gone since its frame (Gone).
+// nothing warped. Where nothing warped covers a pixel, it shows this eye's own last real frame as
+// that eye rendered it, unwarped, at the same place (HeldEye: the held eye's previous image, alpha
+// 0 still), black only without one; ResolveDepth writes that frame's depth there (the farthest
+// without one). The headset ignores alpha; captures read it. The resolves read the primary's own
+// colour at Color (t0), to tell a fill point gone since its frame (Gone), and draw the primary's
+// colour from there at the sub-pixel place each target pixel shows (PrimaryColour), not the nearest
+// pixel Paint wrote.
 cbuffer Reproject : register(b0) {
     row_major float4x4 M;
     uint W, H, SW, SH;
@@ -46,6 +51,7 @@ cbuffer Reproject : register(b0) {
     uint4 PrimaryDepth;       // resolves: the primary's depth area in Depth (origin, size; size 0: none)
     float HeldNearness;       // resolves: the fill is never taken nearer than this (0: none; see Held)
     uint3 Pad;
+    uint4 HeldArea;           // resolves: the held eye's own last frame's depth area in HeldDepth (origin, size; size 0: none)
 };
 #ifdef HELD_MOTION
 // The fill's held pixels (nearer than HeldNearness) land by MHeld, from where its camera would have
@@ -67,6 +73,8 @@ Texture2D<float4> Primary : register(t2);
 Texture2D<float4> Fill : register(t3);
 Texture2D<uint> PrimaryKeys : register(t4);
 Texture2D<uint> FillKeys : register(t5);
+Texture2D<float4> HeldColor : register(t6);  // resolves: this eye's own last real frame, unwarped (the fill's source)
+Texture2D<float> HeldDepth : register(t7);   // resolves: its depth
 RWTexture2D<uint> Keys : register(u0);
 RWTexture2D<IMAGE> Image : register(u1);
 RWTexture2D<IMAGE> Out : register(u2);
@@ -322,11 +330,14 @@ int2 Hole(uint2 p, uint fill, out uint key) {
 // magenta. Sources 2 shows its nearness as grey (white near, a square root so far things still
 // differ), the colour gone. Sources 3 shows the fill alone and 4 the primary alone (what the other
 // left, magenta).
+// 4 is the held eye's own last frame unwarped where nothing warped landed (HeldEye): alpha 0 as
+// nothing, tinted yellow by Sources 1 (by half, the frame still seen through it).
 float4 Shown(float4 color, uint key, uint from) {
-    float source = (3 - from) / 3.0;  // the alpha (see the top)
+    float source = from >= 3 ? 0.0 : (3 - from) / 3.0;  // the alpha (see the top)
     if (Sources == 1) {
-        const float3 tints[4] = { float3(0, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 0, 1) };
-        return float4(from == 0 ? color.rgb : lerp(color.rgb, tints[from], from >= 2 ? 1.0 : 0.6), source);
+        const float3 tints[5] = { float3(0, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 0, 1), float3(1, 1, 0) };
+        const float amounts[5] = { 0.0, 0.6, 1.0, 1.0, 0.6 };
+        return float4(lerp(color.rgb, tints[from], amounts[from]), source);
     }
     if (Sources == 2) return float4(sqrt(key ? ((key - 1) >> CLOSENESS_BITS) / NEARNESS_STEPS : 0).xxx, source);
     return float4(color.rgb, source);
@@ -406,6 +417,123 @@ bool FillsGap(uint2 p, uint fill) {
     return fill && !Held(fill) && Seen(p, fill) != PAST && !Gone(p, fill);
 }
 
+// `image` at `at` (its texels, continuous), filtered linearly between the four texels around it.
+float4 Bilinear(Texture2D<float4> image, float2 at) {
+    uint w, h;
+    image.GetDimensions(w, h);
+    float2 f = at - 0.5;
+    int2 b = int2(floor(f)), last = int2(w, h) - 1;
+    float2 k = f - float2(b);
+    float4 c00 = image.Load(int3(clamp(b, int2(0, 0), last), 0));
+    float4 c10 = image.Load(int3(clamp(b + int2(1, 0), int2(0, 0), last), 0));
+    float4 c01 = image.Load(int3(clamp(b + int2(0, 1), int2(0, 0), last), 0));
+    float4 c11 = image.Load(int3(clamp(b + int2(1, 1), int2(0, 0), last), 0));
+    return lerp(lerp(c00, c10, k.x), lerp(c01, c11, k.x), k.y);
+}
+
+// What target pixel `p` shows where nothing warped covers it: this eye's own last real frame
+// (HeldColor, the held eye's previous image) as that eye rendered it, at the same place of its own
+// image, rather than black. False without that frame (t6 unbound or empty).
+bool HeldEye(uint2 p, out float4 color) {
+    color = float4(0, 0, 0, 1);
+    uint cw, ch;
+    HeldColor.GetDimensions(cw, ch);
+    if (cw == 0 || ch == 0) return false;
+    color = float4(Bilinear(HeldColor, (float2(p) + 0.5) / float2(W, H) * float2(cw, ch)).rgb, 1);
+    return true;
+}
+
+// That frame's depth at the same place (its depth area HeldArea), beside HeldEye's colour; false
+// without it.
+bool HeldEyeDepth(uint2 p, out float depth) {
+    depth = 0;
+    if (HeldArea.z == 0 || HeldArea.w == 0) return false;
+    int2 texel = clamp(int2((float2(p) + 0.5) / float2(W, H) * float2(HeldArea.zw)), int2(0, 0), int2(HeldArea.zw) - 1) + int2(HeldArea.xy);
+    depth = HeldDepth.Load(int3(texel, 0));
+    return true;
+}
+
+// Sub-pixel colour. Paint writes the nearest source pixel's colour at the target pixel it landed in,
+// up to half a pixel from where that target pixel's centre truly is in the source: the warped eye's
+// edges crawl against the real eye's. The resolves (whose M, SW, SH and Jitter are the primary's
+// splat's, its depth area PrimaryDepth) find the source place each target pixel shows: from the
+// winner's depth taken back (Back), then REFINE_STEPS fixed-point steps s += t - landed(s) with the
+// depth at s; its colour is read between the source pixels there (Bilinear). Across a depth edge
+// (the four depth texels at s, or the point found, apart by more than REFINE_EDGE of their nearness)
+// the nearest pixel stays: a blend there would mix the near thing and what is behind it.
+static const int REFINE_STEPS = 3;
+static const float REFINE_EDGE = 0.04;
+
+// The primary's depth at `at` (texels of its depth area, continuous), filtered linearly, and
+// whether the four texels around it are one surface (their nearness within REFINE_EDGE).
+bool SmoothDepth(float2 at, out float depth) {
+    float2 f = at - 0.5;
+    int2 b = int2(floor(f));
+    float2 k = f - float2(b);
+    float d[4];
+    float lo = 1e30, hi = -1e30;
+    [unroll] for (int j = 0; j < 2; ++j) {
+        [unroll] for (int i = 0; i < 2; ++i) {
+            int2 texel = clamp(b + int2(i, j), int2(0, 0), int2(PrimaryDepth.zw) - 1) + int2(PrimaryDepth.xy);
+            float v = Depth.Load(int3(texel, 0));
+            d[j * 2 + i] = v;
+            float n = NearA * v + NearB;
+            lo = min(lo, n); hi = max(hi, n);
+        }
+    }
+    depth = lerp(lerp(d[0], d[1], k.x), lerp(d[2], d[3], k.x), k.y);
+    return hi - lo <= abs(hi) * REFINE_EDGE;
+}
+
+// Where the primary's point at source place `s` (its colour pixels, continuous) lands in the target
+// (`pixel`, continuous), and its target nearness, through M with the depth there; false off one
+// surface.
+bool Forward(float2 s, out float2 pixel, out float nearness) {
+    pixel = float2(0, 0); nearness = 0;
+    float d;
+    if (!SmoothDepth(s * float2(PrimaryDepth.zw) / float2(SW, SH) + Jitter, d)) return false;
+    float2 ndc = float2(s.x / SW * 2 - 1, 1 - s.y / SH * 2);
+    float4 clip = mul(M, float4(ndc, d, 1));
+    if (!(clip.w > 0)) return false;
+    float3 t = clip.xyz / clip.w;
+    pixel = float2((t.x + 1) * 0.5 * W, (1 - t.y) * 0.5 * H);
+    nearness = NearA * t.z + NearB;
+    return true;
+}
+
+// The source place target pixel `p` (the primary's key `key` there) shows, refined (see above);
+// false where it may not be: the nearest pixel then.
+bool Refined(uint2 p, uint key, out float2 s) {
+    s = float2(0, 0);
+    if (PrimaryDepth.z == 0 || PrimaryDepth.w == 0 || SW == 0 || SH == 0) return false;
+    float here = Nearness(key) / NEARNESS_STEPS;
+    float2 t = float2(p) + 0.5;
+    float2 ndc = float2(t.x / W * 2 - 1, 1 - t.y / H * 2);
+    float4 back = mul(Back, float4(ndc, (here - NearB) / NearA, 1));
+    if (!(back.w > 0)) return false;
+    back /= back.w;
+    s = float2((back.x + 1) * 0.5 * SW, (1 - back.y) * 0.5 * SH);
+    float2 scale = float2(SW, SH) / float2(W, H), pixel;
+    float nearness;
+    [unroll] for (int i = 0; i < REFINE_STEPS; ++i) {
+        if (!Forward(s, pixel, nearness)) return false;
+        s += (t - pixel) * scale;
+    }
+    if (!Forward(s, pixel, nearness)) return false;
+    if (any(abs(t - pixel) > 0.5) || abs(nearness - here) > abs(here) * REFINE_EDGE) return false;
+    return all(s >= 0) && all(s <= float2(SW, SH));
+}
+
+// The primary's colour at target pixel `p` (its key `key`): read at the refined source place, or
+// the nearest pixel Paint wrote.
+float4 PrimaryColour(uint2 p, uint key) {
+    uint cw, ch;
+    Color.GetDimensions(cw, ch);
+    float2 s;
+    if (cw == SW && ch == SH && Refined(p, key, s)) return float4(Bilinear(Color, s).rgb, 1);
+    return Primary.Load(int3(p, 0));
+}
+
 [numthreads(8, 8, 1)] void Resolve(uint3 id : SV_DispatchThreadID) {
     if (id.x >= W || id.y >= H) return;
     if (Sources == 3) {
@@ -419,7 +547,7 @@ bool FillsGap(uint2 p, uint fill) {
     uint primary = PrimaryKeys.Load(int3(id.xy, 0));
     if (primary) {
         uint fill = FillKeys.Load(int3(id.xy, 0));
-        Out[id.xy] = FillOver(id.xy, fill, primary) ? Shown(Fill.Load(int3(id.xy, 0)), fill, 1) : Shown(Primary.Load(int3(id.xy, 0)), primary, 0);
+        Out[id.xy] = FillOver(id.xy, fill, primary) ? Shown(Fill.Load(int3(id.xy, 0)), fill, 1) : Shown(PrimaryColour(id.xy, primary), primary, 0);
         return;
     }
     uint fill = FillKeys.Load(int3(id.xy, 0));
@@ -430,7 +558,9 @@ bool FillsGap(uint2 p, uint fill) {
     if (hole.x >= 0) { Out[id.xy] = Shown(Primary.Load(int3(hole, 0)), hole_key, 2); return; }
     if (FillsGap(id.xy, fill)) { Out[id.xy] = Shown(Fill.Load(int3(id.xy, 0)), fill, 1); return; }
     uint behind; int column = Behind(id.xy, behind);
-    Out[id.xy] = column >= 0 ? Shown(Primary.Load(int3(column, id.y, 0)), behind, 2) : Shown(float4(0, 0, 0, 1), 0, 3);
+    if (column >= 0) { Out[id.xy] = Shown(Primary.Load(int3(column, id.y, 0)), behind, 2); return; }
+    float4 held;
+    Out[id.xy] = HeldEye(id.xy, held) ? Shown(held, 0, 4) : Shown(float4(0, 0, 0, 1), 0, 3);
 }
 
 [numthreads(8, 8, 1)] void ResolveDepth(uint3 id : SV_DispatchThreadID) {
@@ -450,8 +580,12 @@ bool FillsGap(uint2 p, uint fill) {
     }
     if (!key) {
         uint behind; int column = Behind(p, behind);
-        key = FillsGap(p, fill) ? fill : column >= 0 ? behind : 1;
+        key = FillsGap(p, fill) ? fill : column >= 0 ? behind : 0;
     }
+    // Nothing warped: the held eye's own last frame's depth where its colour shows (HeldEye), else
+    // the farthest.
+    float held;
+    if (!key) { OutDepth[id.xy + DepthOrigin] = HeldEyeDepth(p, held) ? held : -NearB / NearA; return; }
     float nearness = ((key - 1) >> CLOSENESS_BITS) / NEARNESS_STEPS;
     OutDepth[id.xy + DepthOrigin] = (nearness - NearB) / NearA;
 }

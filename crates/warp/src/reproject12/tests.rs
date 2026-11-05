@@ -199,3 +199,62 @@ fn other_eye_from_this_frame_and_gaps_from_its_own_last_frame() {
     // 34), the one landing on its centre.
     assert_eq!(pixel(&queue, &out, 32, 3), [33 * 4, 0, 0, 255]);
 }
+
+#[test]
+fn nothing_warped_shows_the_eyes_own_frame_and_colour_comes_from_between_pixels() {
+    // As the D3D11 tests, on D3D12 (reverse-Z infinite, P00 = P11 = 1, depth = near / distance).
+    let device = device();
+    let queue = queue(&device);
+    let mut reprojector = Reprojector12::new(&device).unwrap();
+    let (w, h, near) = (64u32, 16u32, 0.1f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[11], projection[14]) = (1.0, 1.0, near, -1.0);
+    let plain = |distance: f32| -> Vec<u8> { (0..w * h).flat_map(|_| (near / distance).to_le_bytes()).collect() };
+    let wall_depth = upload(&device, &queue, (w, h), DXGI_FORMAT_R32_TYPELESS, &plain(1.0));
+    let far_wall_depth = upload(&device, &queue, (w, h), DXGI_FORMAT_R32_TYPELESS, &plain(2.0));
+    let held_depth = upload(&device, &queue, (w, h), DXGI_FORMAT_R32_TYPELESS, &plain(0.5));
+    let columns: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| [(x * 4) as u8, 0, 0, 255])).collect();
+    let own: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |_| [0, 255, (y * 8) as u8, 255])).collect();
+    let columns = upload(&device, &queue, (w, h), DXGI_FORMAT_R8G8B8A8_UNORM, &columns);
+    let own = upload(&device, &queue, (w, h), DXGI_FORMAT_R8G8B8A8_UNORM, &own);
+    let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let out = d3d12::texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, uav).unwrap();
+    let out_depth = d3d12::texture(&device, w, h, DXGI_FORMAT_R32_TYPELESS, uav).unwrap();
+    let targets = Targets { color: &out, depth: Some(&out_depth), depth_rect: None };
+    let mapping = DepthMapping::from_projection(&projection, near).unwrap();
+    let camera = |x: f32, y: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, 0.0] };
+    let run = |reprojector: &mut Reprojector12, view: &View, primary: &Source, fill: Option<&Source>| {
+        let mut recorder = Recorder::new(&device, 1).unwrap();
+        let list = recorder.begin().unwrap().unwrap();
+        reprojector.record(&list, view, primary, fill, &targets).unwrap();
+        recorder.submit(&queue).unwrap();
+        assert!(recorder.idle(2000));
+    };
+
+    // The wall 1 m away from an eye 0.5 m higher lands 4 rows lower (16 rows): its top rows have
+    // nothing warped. The eye's own frame there is held (within the hands' reach), never warped in:
+    // shown unwarped (alpha 0), with its depth. Without it, black and the farthest (depth 0).
+    reprojector.held_reach = 0.9;
+    let view = View { projection, camera: camera(0.0, 0.5), mapping, width: w, height: h };
+    let primary = Source { color: &columns, depth: &wall_depth, depth_rect: None, jitter: [0.0; 2], projection, camera: camera(0.0, 0.0) };
+    let fill = Source { color: &own, depth: &held_depth, depth_rect: None, jitter: [0.0; 2], projection, camera: camera(0.0, 0.5) };
+    run(&mut reprojector, &view, &primary, None);
+    assert_eq!(pixel(&queue, &out, 5, 1), [0, 0, 0, 0], "nothing at all: black");
+    assert!(depth_at(&queue, &out_depth, 5, 1).abs() < 1e-7, "and the farthest");
+    run(&mut reprojector, &view, &primary, Some(&fill));
+    assert_eq!(pixel(&queue, &out, 5, 1), [0, 255, 8, 0], "the eye's own last frame, unwarped");
+    assert!((depth_at(&queue, &out_depth, 5, 1) - near / 0.5).abs() < 1e-7, "its depth");
+    assert_eq!(pixel(&queue, &out, 5, 10), [20, 0, 0, 255], "the wall, warped");
+    reprojector.held_reach = 0.0;
+
+    // The wall 2 m away from an eye 1.025 m to the right: 16.4 columns left, red 4 a column. The
+    // colour between the source pixels is within rounding of 4 * (x + 16.4); the nearest pixel
+    // (column x + 16) would be 1.6 off.
+    let view = View { projection, camera: camera(1.025, 0.0), mapping, width: w, height: h };
+    let primary = Source { depth: &far_wall_depth, ..primary };
+    run(&mut reprojector, &view, &primary, None);
+    for x in 2..44u32 {
+        let red = pixel(&queue, &out, x as usize, 3)[0] as f32;
+        assert!((red - 4.0 * (x as f32 + 16.4)).abs() < 1.0, "column {x}: {red}, the nearest pixel's {}", 4 * (x + 16));
+    }
+}

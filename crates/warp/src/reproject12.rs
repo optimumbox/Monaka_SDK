@@ -60,8 +60,10 @@ struct Layer {
     image: ID3D12Resource,
 }
 
-/// Views per pass: six shader resources (t0-t5), then four unordered access views (u0-u3).
-const VIEWS: u32 = 10;
+/// Views per pass: eight shader resources (t0-t7), then four unordered access views (u0-u3).
+const VIEWS: u32 = 12;
+/// Where the unordered access views start in a pass's views.
+const UAVS: u32 = 8;
 /// Passes per redraw with views of their own: the primary's splat, the fill's, the resolves.
 const PASSES: u32 = 3;
 /// Redraws whose views the heap holds at once (the lists in flight read them).
@@ -112,7 +114,7 @@ pub fn writable(device: &ID3D12Device, format: DXGI_FORMAT) -> bool {
 
 impl Reprojector12 {
     pub fn new(device: &ID3D12Device) -> Result<Self> {
-        let root = compute::root_signature(device, CONSTANTS, &[Table { srvs: 6, uavs: 4 }]).map_err(Error::Shader)?;
+        let root = compute::root_signature(device, CONSTANTS, &[Table { srvs: UAVS, uavs: VIEWS - UAVS }]).map_err(Error::Shader)?;
         let pipeline = |entry| compute::shader_pipeline(device, &root, REPROJECT12_SOURCE, "reproject12.hlsl", entry).map_err(Error::Shader);
         Ok(Self {
             fill_first: false,
@@ -187,16 +189,21 @@ impl Reprojector12 {
                     None => self.null_sources(set, format),
                 }
                 self.null_resolve_inputs(set, format);
-                self.device.CreateUnorderedAccessView(&layer.keys, None, Some(&uav_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + 6));
-                self.device.CreateUnorderedAccessView(&layer.image, None, Some(&uav_desc(format)), self.heap.cpu(set + 7));
+                self.device.CreateUnorderedAccessView(&layer.keys, None, Some(&uav_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + UAVS));
+                self.device.CreateUnorderedAccessView(&layer.image, None, Some(&uav_desc(format)), self.heap.cpu(set + UAVS + 1));
                 self.null_outputs(set, format);
             }
             splats[k] = source.map(|(_, c)| c);
         }
         // The resolves: both layers read, the outputs written, the primary's depth read (asking its
-        // eye about the fill).
+        // eye about the fill), the fill's own frame read unwarped (where nothing warped lands).
         let set = base + VIEWS * 2;
-        let resolve = constants.resolve(splats[0].as_ref());
+        let held = fill.map(|f| {
+            // SAFETY: reads a resource descriptor.
+            let depth = unsafe { f.depth.GetDesc() };
+            depth_area(f.depth_rect, (depth.Width as u32, depth.Height))
+        });
+        let resolve = constants.resolve(splats[0].as_ref(), held);
         // SAFETY: views of live textures (or null views) into our own heap.
         unsafe {
             self.null_sources(set, format);
@@ -210,12 +217,19 @@ impl Reprojector12 {
             self.device.CreateShaderResourceView(&layers[1].image, Some(&srv_desc(format)), self.heap.cpu(set + 3));
             self.device.CreateShaderResourceView(&layers[0].keys, Some(&srv_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + 4));
             self.device.CreateShaderResourceView(&layers[1].keys, Some(&srv_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + 5));
-            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + 6));
-            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(format)), self.heap.cpu(set + 7));
-            self.device.CreateUnorderedAccessView(out.color, None, Some(&uav_desc(format)), self.heap.cpu(set + 8));
+            self.null_held(set, format);
+            if let Some(f) = fill {
+                // This eye's own last real frame, unwarped (`reproject.hlsl`'s HeldEye).
+                self.device.CreateShaderResourceView(f.color, Some(&srv_desc(read_format(f.color.GetDesc().Format))), self.heap.cpu(set + 6));
+                let depth_format = depth_read_format(f.depth.GetDesc().Format).ok_or(Error::Unsupported("depth format"))?;
+                self.device.CreateShaderResourceView(f.depth, Some(&srv_desc(depth_format)), self.heap.cpu(set + 7));
+            }
+            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + UAVS));
+            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(format)), self.heap.cpu(set + UAVS + 1));
+            self.device.CreateUnorderedAccessView(out.color, None, Some(&uav_desc(format)), self.heap.cpu(set + UAVS + 2));
             match out.depth {
-                Some(depth) => self.device.CreateUnorderedAccessView(depth, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + 9)),
-                None => self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + 9)),
+                Some(depth) => self.device.CreateUnorderedAccessView(depth, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + UAVS + 3)),
+                None => self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + UAVS + 3)),
             }
         }
         const SRV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -318,6 +332,19 @@ impl Reprojector12 {
             for k in 4..6 {
                 self.device.CreateShaderResourceView(None, Some(&srv_desc(DXGI_FORMAT_R32_UINT)), self.heap.cpu(set + k));
             }
+            self.null_held(set, format);
+        }
+    }
+
+    /// Null views for the held eye's own frame the resolves read (t6, t7), in the set at `set`.
+    ///
+    /// # Safety
+    /// `set` is a set of our own heap.
+    unsafe fn null_held(&self, set: u32, format: DXGI_FORMAT) {
+        // SAFETY: null views into our own heap.
+        unsafe {
+            self.device.CreateShaderResourceView(None, Some(&srv_desc(format)), self.heap.cpu(set + 6));
+            self.device.CreateShaderResourceView(None, Some(&srv_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + 7));
         }
     }
 
@@ -328,8 +355,8 @@ impl Reprojector12 {
     unsafe fn null_outputs(&self, set: u32, format: DXGI_FORMAT) {
         // SAFETY: null views into our own heap.
         unsafe {
-            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(format)), self.heap.cpu(set + 8));
-            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + 9));
+            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(format)), self.heap.cpu(set + UAVS + 2));
+            self.device.CreateUnorderedAccessView(None, None, Some(&uav_desc(DXGI_FORMAT_R32_FLOAT)), self.heap.cpu(set + UAVS + 3));
         }
     }
 }

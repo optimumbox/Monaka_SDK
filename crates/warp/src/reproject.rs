@@ -64,9 +64,12 @@ pub(crate) struct Constants {
     /// The target nearness nearer than which the fill is never taken ([`held_nearness`]; 0: none).
     pub held_nearness: f32,
     pub pad: [u32; 3],
+    /// Resolves: the depth area (origin, size; size 0: none) of the held eye's own last real frame,
+    /// shown unwarped where nothing warped lands (`reproject.hlsl`'s HeldEye).
+    pub held_area: [u32; 4],
 }
 
-const _: () = assert!(size_of::<Constants>() == 56 * 4);
+const _: () = assert!(size_of::<Constants>() == 60 * 4);
 
 /// The layout of the HLSL `cbuffer HeldMotion` (D3D11 only, b1): how the fill's held pixels land
 /// ([`Reprojector::fill_held_camera`]).
@@ -134,12 +137,27 @@ impl Constants {
     }
 
     /// This redraw's resolves, asking the primary's eye about the fill (`primary`: its splat's
-    /// constants): the way back into its frame and its depth area. Without it, nothing to ask.
-    pub(crate) fn resolve(&self, primary: Option<&Self>) -> Self {
+    /// constants): the way back into its frame and its depth area, and its splat's matrix, sizes
+    /// and jitter (`reproject.hlsl`'s PrimaryColour finds each pixel's sub-pixel source place with
+    /// them). Without it, nothing to ask. `held`: the depth area of the held eye's own last frame
+    /// (its colour and depth bound at t6 and t7), shown where nothing warped lands.
+    pub(crate) fn resolve(&self, primary: Option<&Self>, held: Option<([u32; 2], (u32, u32))>) -> Self {
+        let held_area = held.map_or([0; 4], |(origin, (width, height))| [origin[0], origin[1], width, height]);
         let back = primary.and_then(|p| Some((invert(&p.m)?, p)));
         match back {
-            Some((back, p)) => Self { back, primary_depth: [p.depth_origin[0], p.depth_origin[1], p.depth_width, p.depth_height], ..*self },
-            None => *self,
+            Some((back, p)) => Self {
+                back,
+                primary_depth: [p.depth_origin[0], p.depth_origin[1], p.depth_width, p.depth_height],
+                m: p.m,
+                source_width: p.source_width,
+                source_height: p.source_height,
+                depth_width: p.depth_width,
+                depth_height: p.depth_height,
+                jitter: p.jitter,
+                held_area,
+                ..*self
+            },
+            None => Self { held_area, ..*self },
         }
     }
 }
@@ -216,8 +234,8 @@ pub struct Reprojector {
     /// a hand moved since the fill's frame puts a second gun beside the warped one).
     pub fill_held_trusted: bool,
     /// A debug view instead of the image (`reproject.hlsl`'s `Shown`): 0 none, 1 each pixel tinted
-    /// by where it came from (the fill green, a neighbour solid blue, nothing magenta), 2 its nearness as
-    /// grey.
+    /// by where it came from (the fill green, a neighbour solid blue, the eye's own last frame
+    /// unwarped where nothing warped landed yellow, nothing at all magenta), 2 its nearness as grey.
     pub sources: u32,
     device: ID3D11Device,
     clear: ID3D11ComputeShader,
@@ -384,7 +402,7 @@ impl Reprojector {
         self.held.bind_at(context, 1);
         let redraw = Constants { sources: self.sources, held_nearness: held_nearness(view, self.held_reach), ..Constants::redraw(view, depth.and(depth_size), [0, 0], self.fill_first) };
         let splat_of = |frame: &Frame| redraw.splat(view, (frame.color.width, frame.color.height), ([0, 0], (frame.depth.width, frame.depth.height)), frame.jitter, &frame.projection, &frame.camera);
-        let resolve = redraw.resolve(splat_of(primary).as_ref());
+        let resolve = redraw.resolve(splat_of(primary).as_ref(), fill.map(|f| ([0, 0], (f.depth.width, f.depth.height))));
         // The fill's held pixels from the held camera, when there is one and it makes a splat.
         let held_m = fill.zip(self.fill_held_camera).and_then(|(frame, camera)| redraw.splat(view, (0, 0), ([0, 0], (0, 0)), [0.0; 2], &frame.projection, &camera)).map(|s| s.m);
         let trusted = (held_m.is_some() && self.fill_held_trusted) as u32;
@@ -412,7 +430,8 @@ impl Reprojector {
             self.constants.update(context, &resolve);
             context.CSSetUnorderedAccessViews(0, 3, Some([None, None, Some(output_uav.clone())].as_ptr()), None);
             // The primary's depth, for asking its eye about the fill.
-            // Its colour, for telling a fill point gone since its frame (`reproject.hlsl`'s Gone).
+            // Its colour, for telling a fill point gone since its frame (`reproject.hlsl`'s Gone) and
+            // for its sub-pixel colour (PrimaryColour). The fill's own frame unwarped (HeldEye).
             let resources = [
                 Some(primary.color.view.clone()),
                 Some(primary.depth.view.clone()),
@@ -420,6 +439,8 @@ impl Reprojector {
                 Some(layers[1].image_srv.clone()),
                 Some(layers[0].keys_srv.clone()),
                 Some(layers[1].keys_srv.clone()),
+                fill.map(|f| f.color.view.clone()),
+                fill.map(|f| f.depth.view.clone()),
             ];
             context.CSSetShaderResources(0, Some(&resources));
             context.CSSetShader(&self.resolve, None);
@@ -434,7 +455,7 @@ impl Reprojector {
                 context.Dispatch(dx, dy, 1);
                 context.CSSetUnorderedAccessViews(3, 1, Some(slot3.as_ptr()), None);
             }
-            context.CSSetShaderResources(0, Some(&[None, None, None, None, None, None]));
+            context.CSSetShaderResources(0, Some(&[None, None, None, None, None, None, None, None]));
         }
         saved.restore(context);
         // The layer textures are only reached through their views.

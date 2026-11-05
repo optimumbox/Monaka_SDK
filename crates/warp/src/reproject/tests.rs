@@ -540,3 +540,118 @@ fn a_depth_stencil_frame_gives_its_depth_plane_as_r32() {
     let (_, _, texels) = read_image(&device, &context, &plain).unwrap();
     assert!(texels.chunks(4).all(|t| f32::from_le_bytes(t.try_into().unwrap()) == 0.375));
 }
+
+#[test]
+fn where_nothing_warped_lands_the_eye_shows_its_own_last_frame_not_black() {
+    // A wall 1 m away warped into an eye 0.5 m higher: the wall lands 4 rows lower (P11 = 1, 16
+    // rows), leaving its top rows with no primary pixel on them or around them (no crack, hole or
+    // neighbour behind). The eye's own last frame shows a held thing there (0.5 m, within the
+    // hands' reach), never taken warped. Those rows show that frame as the eye rendered it,
+    // unwarped (alpha 0, blue = 8 * row), with its depth beside it. Without that frame, black.
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (32u32, 16u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let plain = |distance: f32| -> Vec<u8> { (0..w * h).flat_map(|_| at(distance).to_le_bytes()).collect() };
+    let wall_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &plain(1.0));
+    let held_depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &plain(0.5));
+    let red: Vec<u8> = (0..w * h).flat_map(|_| [255, 0, 0, 255]).collect();
+    let own: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |_| [0, 255, (y * 8) as u8, 255])).collect();
+    let (red, own) = (texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &red), texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &own));
+    let camera = |y: f32| -> Mat34 { [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, 0.0] };
+    let primary = reprojector.capture(&context, &red, &wall_depth, projection, camera(0.0), None).unwrap();
+    let fill = reprojector.capture(&context, &own, &held_depth, projection, camera(0.5), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(0.5), mapping, width: w, height: h };
+    reprojector.held_reach = 0.9;
+    // The negative control: no frame of its own, black.
+    let image = reprojector.run(&context, &view, &primary, None).unwrap().clone();
+    assert_eq!(read_pixel(&device, &context, &image, 5, 1).unwrap(), [0, 0, 0, 0], "nothing at all: black");
+    assert_eq!(read_pixel(&device, &context, &image, 5, 10).unwrap(), [255, 0, 0, 255], "the wall, warped");
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    for y in 0..3 {
+        for x in [0, 5, w - 1] {
+            assert_eq!(read_pixel(&device, &context, &image, x, y).unwrap(), [0, 255, (y * 8) as u8, 0], "pixel {x}, {y}: the eye's own last frame, unwarped");
+        }
+    }
+    assert_eq!(read_pixel(&device, &context, &image, 5, 10).unwrap(), [255, 0, 0, 255], "the wall, warped, as before");
+    // Its depth: that frame's own; the farthest without it.
+    let depth_at = |texture: &ID3D11Texture2D, x: u32, y: u32| {
+        let (width, _, texels) = read_image(&device, &context, texture).unwrap();
+        let i = ((y * width + x) * 4) as usize;
+        f32::from_le_bytes([texels[i], texels[i + 1], texels[i + 2], texels[i + 3]])
+    };
+    let (_, depth) = reprojector.run_with_depth(&context, &view, &primary, Some(&fill), (w, h)).unwrap();
+    let depth = depth.clone();
+    assert!((depth_at(&depth, 5, 1) - at(0.5)).abs() < 1e-6, "the own frame's depth: {}", depth_at(&depth, 5, 1));
+    assert!((depth_at(&depth, 5, 10) - at(1.0)).abs() < 1e-4, "the wall's depth: {}", depth_at(&depth, 5, 10));
+    let (_, depth) = reprojector.run_with_depth(&context, &view, &primary, None, (w, h)).unwrap();
+    let depth = depth.clone();
+    let farthest = -mapping.b / mapping.a;
+    assert!((depth_at(&depth, 5, 1) - farthest).abs() < 1e-6, "without it the farthest: {}", depth_at(&depth, 5, 1));
+    // The tint: yellow over the own frame, apart from nothing's magenta.
+    reprojector.sources = 1;
+    let image = reprojector.run(&context, &view, &primary, Some(&fill)).unwrap().clone();
+    let tinted = read_pixel(&device, &context, &image, 5, 1).unwrap();
+    assert!(tinted[0] > 120 && tinted[1] == 255 && tinted[2] < 20 && tinted[3] == 0, "yellow: {tinted:?}");
+    let image = reprojector.run(&context, &view, &primary, None).unwrap().clone();
+    assert_eq!(read_pixel(&device, &context, &image, 5, 1).unwrap(), [255, 0, 255, 0], "nothing: magenta");
+}
+
+#[test]
+fn a_sub_pixel_shift_draws_the_colour_between_source_pixels() {
+    // Cameras 1.025 m apart before a wall 2 m away (P00 = 1, 64 columns): each column lands 16.4
+    // pixels left, so target column x's centre shows the source 16.4 columns right of it, between
+    // two source pixels. Red rises 4 a column: the real eye there would see 4 * (x + 16.4). The
+    // nearest pixel (what Paint wrote, Sources 4: the negative control) is 0.4 of a column off, 1.6
+    // in red; the colour read between the two source pixels is within rounding.
+    let (device, context, _) = create_device(None).unwrap();
+    let mut reprojector = Reprojector::new(&device).unwrap();
+    let (w, h) = (64u32, 8u32);
+    let (n, f) = (0.1f32, 100.0f32);
+    let mut projection = [0.0f32; 16];
+    (projection[0], projection[5], projection[10], projection[11], projection[14]) = (1.0, 1.0, f / (n - f), n * f / (n - f), -1.0);
+    let at = |distance: f32| -projection[10] + projection[11] / distance;
+    let depth: Vec<u8> = (0..w * h).flat_map(|_| at(2.0).to_le_bytes()).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth);
+    let columns: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| [(x * 4) as u8, 0, 0, 255])).collect();
+    let this = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &columns);
+    let camera = |x: f32| -> Mat34 { [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] };
+    let primary = reprojector.capture(&context, &this, &depth, projection, camera(0.0), None).unwrap();
+    let mapping = DepthMapping::from_projection(&projection, n).unwrap();
+    let view = View { projection, camera: camera(1.025), mapping, width: w, height: h };
+    let error = |reprojector: &mut Reprojector| {
+        let image = reprojector.run(&context, &view, &primary, None).unwrap().clone();
+        let columns = 2..44u32;
+        let total: f32 = columns.clone().map(|x| (read_pixel(&device, &context, &image, x, 3).unwrap()[0] as f32 - 4.0 * (x as f32 + 16.4)).abs()).sum();
+        total / columns.len() as f32
+    };
+    reprojector.sources = 4;
+    let nearest = error(&mut reprojector);
+    reprojector.sources = 0;
+    let refined = error(&mut reprojector);
+    assert!(nearest > 1.2, "the nearest pixel is off: {nearest}");
+    assert!(refined < 0.6 && refined < nearest / 2.0, "between the source pixels: {refined} (nearest {nearest})");
+
+    // Across a depth edge the nearest pixel stays: a box 0.5 m away before the wall, the eye 0.1 m
+    // to the right (the box lands 6.4 pixels left, the wall 1.6). Every pixel is the box's colour
+    // or the wall's, never the two blended at the box's sides; inside the wall, between its
+    // pixels as above.
+    let (box_columns, wall_red) = (24..36u32, 200u8);
+    let depth: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| at(if box_columns.contains(&x) { 0.5 } else { 2.0 }).to_le_bytes())).collect();
+    let depth = texture(&device, w, h, DXGI_FORMAT_R32_FLOAT, &depth);
+    let colours: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(|x| if box_columns.contains(&x) { [0u8, 0, 255, 255] } else { [wall_red, (x * 4) as u8, 0, 255] })).collect();
+    let this = texture(&device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &colours);
+    let primary = reprojector.capture(&context, &this, &depth, projection, camera(0.0), None).unwrap();
+    let view = View { camera: camera(0.1), ..view };
+    let image = reprojector.run(&context, &view, &primary, None).unwrap().clone();
+    for x in 0..w {
+        let pixel = read_pixel(&device, &context, &image, x, 3).unwrap();
+        assert!(pixel[..3] == [0, 0, 255] || (pixel[0] == wall_red && pixel[2] == 0), "column {x}: {pixel:?}, the box and the wall blended");
+    }
+    let green = read_pixel(&device, &context, &image, 8, 3).unwrap()[1] as f32;
+    assert!((green - 4.0 * (8.0 + 1.6)).abs() < 0.6, "the wall between its pixels: {green}");
+}

@@ -219,7 +219,7 @@ fn uav_desc(format: DXGI_FORMAT) -> D3D11_UNORDERED_ACCESS_VIEW_DESC {
 /// The compute bindings the passes change on the game's context.
 struct SavedCompute {
     shader: Option<ID3D11ComputeShader>,
-    resources: [Option<ID3D11ShaderResourceView>; 6],
+    resources: [Option<ID3D11ShaderResourceView>; 8],
     uavs: [Option<ID3D11UnorderedAccessView>; 3],
     constants: [Option<ID3D11Buffer>; 2],
 }
