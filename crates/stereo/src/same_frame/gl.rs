@@ -124,6 +124,9 @@ pub struct GlDlss {
     pub frame: fn() -> Option<GlDlssFrame>,
     /// The game's scene depth now, behind the frame being presented (both eyes, as the colour).
     pub depth: fn() -> Option<GlDepth>,
+    /// The game's own motion for the frame being presented, if it draws one: both eyes side by
+    /// side as the colour, an RGBA float framebuffer (`monaka_warp::ObjectMotion`'s tested kind).
+    pub motion: Option<fn() -> Option<GlMotion>>,
     /// Where `nvngx_dlss.dll` is, and a folder NGX may write into.
     pub dlls: &'static Path,
     pub data: &'static Path,
@@ -150,6 +153,14 @@ pub struct GlDlssFrame {
 /// The upscaled eye's size in a `width` x `height` frame for `display` (fractions).
 pub fn display_size(width: u32, height: u32, display: [f32; 2]) -> (u32, u32) {
     region_size(width, height, [0.0, 0.0, display[0], display[1]])
+}
+
+/// A GL framebuffer holding a frame's own motion ([`GlDlss::motion`]): its name and size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlMotion {
+    pub framebuffer: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// A GL depth texture: its name, size and whether it is multisampled (its sample 0 is read).
@@ -723,6 +734,17 @@ impl State {
                 return None;
             }
         };
+        // The game's own motion, when it drew one the size of the frame; without it, the camera's.
+        let motion = dlss.motion.and_then(|f| f()).filter(|m| (m.width, m.height) == (width, height)).and_then(|m| match bridge.capture_floats(m.framebuffer, m.width, m.height) {
+            Ok(texture) => Some(texture.clone()),
+            Err(e) => {
+                if self.dlss_failures < 5 {
+                    log!("DLSS: the game's motion: {e}");
+                }
+                self.dlss_failures += 1;
+                None
+            }
+        });
         if self.upscaler.as_ref().is_none_or(|made| made.render() != render || made.display() != dlss.display) {
             self.upscaler = None;
             let settings = monaka_dlss11::Settings {
@@ -758,7 +780,7 @@ impl State {
             self.dlss_last[eye] = Some((now, position));
             let left = eye as u32 * render.0;
             let part = D3D11_BOX { left, top: 0, front: 0, right: left + render.0, bottom: render.1, back: 1 };
-            let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut, items: drawn.items };
+            let frame = monaka_dlss11::EyeFrame { color: image, color_box: part, depth: &depth, depth_box: part, view, jitter: drawn.jitter, frame_time_ms, reset: cut, items: drawn.items, object: motion.as_ref().map(|m| (m, part)) };
             match self.upscaler.as_mut()?.upscale(context, eye, &frame) {
                 // The left eye's DLSS sent to the GPU on its own: one long job for both eyes held
                 // the viewer's work behind it for about 2 ms, two halves hold it about 1 ms.

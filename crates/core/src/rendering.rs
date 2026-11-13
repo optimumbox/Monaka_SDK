@@ -206,7 +206,7 @@ const fn ends_with(text: &str, end: &str) -> bool {
 
 /// The Rendering tab's options in their order: the stereo method, frame generation, the upscaler per
 /// eye, depth to the headset, foveation, the render size.
-const ORDER: [&str; 9] = ["stereo", "framegen", "upscale_per_eye", "fsr", "fsr_scale", "fsr_sharpness", "headset_depth", "foveated_rendering", "render_size"];
+const ORDER: [&str; 10] = ["stereo", "framegen", "upscale_per_eye", "fsr", "fsr_scale", "fsr_sharpness", "headset_depth", "foveated_rendering", "render_size", "supersampling"];
 
 /// Where option `opt` goes among its tab's (the window sorts each tab's options by it, keeping the
 /// game's order otherwise): the Rendering tab in [`ORDER`], a game's own after them.

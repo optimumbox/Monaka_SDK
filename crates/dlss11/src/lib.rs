@@ -20,7 +20,7 @@
 mod ngx;
 
 use monaka_channel::d3d;
-use monaka_warp::{EyeView, HeldItem, MotionPass, Moved, SharpenPass};
+use monaka_warp::{EyeView, HeldItem, MotionPass, Moved, ObjectMotion, SharpenPass};
 /// A 3x4 item-to-world matrix (canonical, metres).
 type Mat34 = [f32; 12];
 use std::ffi::{CStr, c_void};
@@ -31,7 +31,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16G16_FLOAT,
-    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
 };
 use windows::core::Interface;
 
@@ -256,6 +256,9 @@ pub struct EyeFrame<'a> {
     /// Where each hand's item (left, right) was as the eye was drawn (canonical, metres,
     /// item-to-world), if known: within the hands' reach the motion follows it.
     pub items: [Option<Mat34>; 2],
+    /// The game's tested object motion (RGBA32F: UV motion, the particles' share, the depth it was
+    /// drawn at; `monaka_warp::ObjectMotion`) and the eye's part of it (render size), if drawn.
+    pub object: Option<(&'a ID3D11Texture2D, D3D11_BOX)>,
 }
 
 struct Eye {
@@ -279,6 +282,8 @@ pub struct Dlss11 {
     /// The render-size inputs, shared by both eyes (written and read in turn on one context).
     color: Option<(DXGI_FORMAT, ID3D11Texture2D)>,
     depth_in: ID3D11Texture2D,
+    /// The eye's part of the object motion, made at its first frame.
+    object_in: Option<ID3D11Texture2D>,
     depth: (ID3D11Texture2D, ID3D11UnorderedAccessView),
     motion_vectors: (ID3D11Texture2D, ID3D11UnorderedAccessView),
     /// Where pixels moved on their own (render size, shared by both eyes like the inputs).
@@ -400,7 +405,7 @@ impl Dlss11 {
             d3d::create_texture(device, &desc).ok()
         };
         let probe = staging().zip(staging()).map(|(a, b)| Probe { staging: [a, b], pending: [None; 2], calls: [0; 2], shares: [[(0.0, 0); 2]; 2], resets: 0 });
-        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, depth, motion_vectors, moved, eyes: Vec::new(), probe };
+        let mut this = Self { device: device.clone(), parameters, motion, sharpen, settings, color: None, depth_in, object_in: None, depth, motion_vectors, moved, eyes: Vec::new(), probe };
         for _ in 0..2 {
             let output = with_uav(device, display, DXGI_FORMAT_R8G8B8A8_UNORM)?;
             let upscaled = match this.sharpen {
@@ -462,12 +467,24 @@ impl Dlss11 {
             context.CopySubresourceRegion(color, 0, 0, 0, 0, frame.color, 0, Some(&frame.color_box));
             context.CopySubresourceRegion(&self.depth_in, 0, 0, 0, 0, frame.depth, 0, Some(&frame.depth_box));
         }
+        let object = match frame.object.filter(|(_, part)| size(part) == render) {
+            Some((given, part)) => {
+                if self.object_in.is_none() {
+                    self.object_in = Some(texture(&self.device, render, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D11_BIND_SHADER_RESOURCE.0 as u32)?);
+                }
+                let object_in = self.object_in.as_ref().expect("made above");
+                // SAFETY: a copy between two RGBA32F textures on our own context.
+                unsafe { context.CopySubresourceRegion(object_in, 0, 0, 0, 0, given, 0, Some(&part)) };
+                Some(ObjectMotion { texture: object_in, scale: [1.0, 1.0] })
+            }
+            None => None,
+        };
         let state = &mut self.eyes[eye];
         let previous = if frame.reset { None } else { state.previous };
         let items = [0, 1].map(|side| Some(HeldItem { now: frame.items[side]?, before: state.previous_items[side]? }));
         let moved = Moved { previous_depth: previous.map(|_| &state.previous_depth.1), mask: &self.moved.1, held_reach: self.settings.held_reach, items };
         self.motion
-            .run_moved(context, &self.depth_in, &frame.view, previous.as_ref(), None, &self.motion_vectors.1, &self.depth.1, Some(moved), render)
+            .run_moved(context, &self.depth_in, &frame.view, previous.as_ref(), object, &self.motion_vectors.1, &self.depth.1, Some(moved), render)
             .map_err(|e| Error::Failed(format!("motion vectors: {e}")))?;
         // SAFETY: copies between two of our own same-shaped R32 textures on our context.
         unsafe { context.CopyResource(&state.previous_depth.0, &self.depth.0) };
@@ -645,7 +662,7 @@ mod tests {
         for n in 0..4u32 {
             let eye = (n % 2) as usize;
             let part = D3D11_BOX { left: eye as u32 * render.0, top: 0, front: 0, right: (eye as u32 + 1) * render.0, bottom: render.1, back: 1 };
-            let frame = EyeFrame { color: &colour, color_box: part, depth: &depth, depth_box: part, view, jitter: jitter(n), frame_time_ms: 11.0, reset: n < 2, items: [None; 2] };
+            let frame = EyeFrame { color: &colour, color_box: part, depth: &depth, depth_box: part, view, jitter: jitter(n), frame_time_ms: 11.0, reset: n < 2, items: [None; 2], object: None };
             let out = dlss.upscale(&context, eye, &frame).expect("upscale");
             let desc = d3d::texture_desc(&out);
             assert_eq!((desc.Width, desc.Height), display);

@@ -8,7 +8,7 @@ use monaka_channel::d3d;
 use monaka_core::camera::{Mat34, Mat44, compose, position, rigid_inverse};
 use monaka_core::depth::reprojection;
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16_FLOAT;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
 use windows::core::{Interface, s};
 
 pub const MOTION_SOURCE: &str = include_str!("motion.hlsl");
@@ -59,6 +59,8 @@ pub struct EyeView {
 }
 
 /// The game's object motion: its texture (R16G16_FLOAT, render size) and the scale to UV units.
+/// An R32G32B32A32_FLOAT texture is tested object motion (`motion.hlsl`): z the particles' share
+/// of the pixel, w the window depth the motion was drawn at.
 pub struct ObjectMotion<'a> {
     pub texture: &'a ID3D11Texture2D,
     pub scale: [f32; 2],
@@ -95,8 +97,9 @@ pub struct MotionPass {
     shader: ID3D11ComputeShader,
     constants: ConstantBuffer<Constants>,
     depth: Option<Readable>,
-    /// A view of the game's object-motion texture, kept while it is the same texture.
-    object: Option<(usize, ID3D11ShaderResourceView)>,
+    /// A view of the game's object-motion texture, kept while it is the same texture, and whether
+    /// it is tested object motion.
+    object: Option<(usize, ID3D11ShaderResourceView, bool)>,
 }
 
 impl MotionPass {
@@ -110,21 +113,22 @@ impl MotionPass {
         })
     }
 
-    fn object_view(&mut self, texture: &ID3D11Texture2D) -> Option<ID3D11ShaderResourceView> {
+    fn object_view(&mut self, texture: &ID3D11Texture2D) -> Option<(ID3D11ShaderResourceView, bool)> {
         let key = texture.as_raw() as usize;
-        if let Some((known, view)) = &self.object
+        if let Some((known, view, tested)) = &self.object
             && *known == key
         {
-            return Some(view.clone());
+            return Some((view.clone(), *tested));
         }
         let desc = d3d::texture_desc(texture);
         if desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 == 0 {
             return None;
         }
+        let tested = desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
         // The game's live texture allows shader reads (checked above).
-        let view = shader_view(&self.device, texture, DXGI_FORMAT_R16G16_FLOAT).ok()?;
-        self.object = Some((key, view.clone()));
-        Some(view)
+        let view = shader_view(&self.device, texture, if tested { DXGI_FORMAT_R32G32B32A32_FLOAT } else { DXGI_FORMAT_R16G16_FLOAT }).ok()?;
+        self.object = Some((key, view.clone(), tested));
+        Some((view, tested))
     }
 
     /// Writes this frame's motion vectors (`motion`, an R16G16_FLOAT view) and depth (`depth_out`,
@@ -170,7 +174,9 @@ impl MotionPass {
         };
         let object_view = object.as_ref().and_then(|o| self.object_view(o.texture));
         let previous_depth = moved.as_ref().and_then(|m| m.previous_depth).filter(|_| previous.is_some()).cloned();
-        let flags = u32::from(moved.is_some()) | (u32::from(previous_depth.is_some()) << 1);
+        let tested = object_view.as_ref().is_some_and(|(_, tested)| *tested);
+        let object_view = object_view.map(|(view, _)| view);
+        let flags = u32::from(moved.is_some()) | (u32::from(previous_depth.is_some()) << 1) | (u32::from(tested) << 2);
         let p = previous.map_or(current.projection, |v| v.projection);
         let mut items = [[0.0; 16]; 2];
         let mut item_at = [[0.0; 4]; 2];

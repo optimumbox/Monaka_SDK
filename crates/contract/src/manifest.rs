@@ -915,6 +915,17 @@ pub const RENDER_SIZE: Opt = opt(
 .on(Shown::Rendering)
 .launcher();
 
+/// Supersampling: the eye size the launcher settles (from `render_size` or `eye_size`) made this
+/// many times its pixels, each side by the factor's square root (1: as it is).
+pub const SUPERSAMPLING: Opt = opt(
+    "supersampling",
+    "Supersampling",
+    "Renders each eye at this many times the headset resolution's pixels, then the headset scales it down: sharper, much heavier on the GPU. 1 is off.",
+    Kind::Number { min: 1.0, max: 8.0, step: 0.05, default: 1.0 },
+)
+.on(Shown::Rendering)
+.launcher();
+
 /// A render size of the player's own, beside [`render_size`].
 pub const OWN_EYE_SIZE: Opt = line("eye_size", "Render size (WxH)", "A render size of your own; replaces render_size.", Kind::Size).launcher();
 

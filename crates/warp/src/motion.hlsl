@@ -17,13 +17,18 @@
 // With the hands' items given (where each was this frame and the eye's previous one), what is within
 // reach moves with the nearer item instead of the camera: its motion vector follows the hand, the
 // depth test checks it like any other, and an upscaler keeps its history (the gun's sights sharp).
+// A tested object motion (Flags bit 2: RGBA, the game's own pass) carries, besides its motion (xy),
+// how much of the pixel is a particle (z: smoke, fire, sparks) and the window depth its motion was
+// drawn at (w): the motion counts only where that is still the nearest surface (what was drawn over
+// it later keeps the camera's), the mask's test follows it (a talking face keeps its history), and
+// the particles' share goes into the mask, so their trails are not smeared over what is behind.
 cbuffer Motion : register(b0) {
     row_major float4x4 M;
     uint W, H;                // render size (the vectors' and depth output's)
     uint DW, DH;              // the depth texture's size
     float2 ObjectScale;       // object motion to UV units (0: none)
     uint HasObject;
-    uint Flags;               // bit 0: write the mask; bit 1: the previous depth is there
+    uint Flags;               // bit 0: write the mask; bit 1: the previous depth is there; bit 2: tested object motion
     float4 Linear;            // the previous projection's z row terms: P[2][2], P[2][3], P[3][2], P[3][3]
     float4 Held;              // the depth the hands' reach away, and which way is nearer (y: 1, -1; 0 none)
     row_major float4x4 Unproject; // this frame's NDC and depth to the world
@@ -34,7 +39,7 @@ cbuffer Motion : register(b0) {
 // How far from an item's origin (its grip) what moves with it reaches, metres.
 static const float ItemReach = 0.7;
 Texture2D<float> Depth : register(t0);
-Texture2D<float2> Object : register(t1);
+Texture2D<float4> Object : register(t1);
 RWTexture2D<float2> Motion : register(u0);
 RWTexture2D<float> DepthOut : register(u1);
 Texture2D<float> PreviousDepth : register(t2);
@@ -72,13 +77,26 @@ float Along(float d) {
         float2 p = previous.xy / previous.w;
         mv = float2(p.x - ndc.x, ndc.y - p.y) * 0.5;
     }
-    if (HasObject) mv += Object.Load(int3(id.xy, 0)) * ObjectScale;
+    float2 own = float2(0, 0);
+    float particles = 0;
+    if (HasObject) {
+        float4 object = Object.Load(int3(id.xy, 0));
+        if (Flags & 4) {
+            particles = saturate(object.z);
+            // Its own motion only where what drew it is still what is seen there.
+            float a = Along(object.w), b = Along(d);
+            if (object.w >= 0 && abs(a - b) <= 0.01 * max(min(a, b), 1e-6)) own = object.xy * ObjectScale;
+        } else {
+            own = object.xy * ObjectScale;
+        }
+    }
+    mv += own;
     Motion[id.xy] = mv;
     DepthOut[id.xy] = d;
     if (Flags & 1) {
         float moved = 0;
         if ((Flags & 2) && previous.w > 1e-6) {
-            float2 p = previous.xy / previous.w;
+            float2 p = previous.xy / previous.w + float2(2, -2) * own;
             if (all(abs(p) < 1)) {
                 float expect = Along(previous.z / previous.w);
                 int2 at = int2((p.x * 0.5 + 0.5) * W, (0.5 - p.y * 0.5) * H);
@@ -98,6 +116,8 @@ float Along(float d) {
         // Within the hands' reach without the items' motion: moved with the controllers, whatever
         // the depth test says.
         if (held && !carried) moved = 1;
+        // Smoke, fire and sparks: partly this frame's (a full share would show them at the render size).
+        moved = max(moved, particles * 0.75);
         Moved[id.xy] = moved;
     }
 }

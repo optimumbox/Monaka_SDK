@@ -519,6 +519,7 @@ impl Warping {
             frame_time_ms,
             reset: cut,
             items: [None; 2],
+            object: None,
         };
         match self.dlss.as_mut()?.upscale(&self.context, eye, &frame) {
             Ok(image) => {

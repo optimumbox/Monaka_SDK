@@ -6,7 +6,7 @@
 //! asks [`ready`] (or [`chain_ready`], or the loop step [`hold`]) before publishing.
 
 use crate::driver::Driver;
-use monaka_contract::manifest::{OWN_EYE_SIZE, Opt, RENDER_SIZE};
+use monaka_contract::manifest::{OWN_EYE_SIZE, Opt, RENDER_SIZE, SUPERSAMPLING};
 use monaka_core::sync::Locked;
 use monaka_producer::game::{Component, Game, Lack, On, Run, Start};
 use monaka_producer::log;
@@ -36,7 +36,7 @@ pub enum Ask {
     Cannot(String),
 }
 
-const OPTIONS: [Opt; 2] = [RENDER_SIZE, OWN_EYE_SIZE];
+const OPTIONS: [Opt; 3] = [RENDER_SIZE, SUPERSAMPLING, OWN_EYE_SIZE];
 
 /// The eye size as a ready-made component for game `G`: on with a size asked for, the size asked
 /// for at the presents after the start ([`ready`]), the game's own size back at the give-back. A

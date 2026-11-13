@@ -23,7 +23,7 @@ use monaka_channel::d3d;
 use std::ffi::c_void;
 use std::fmt;
 use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, ID3D11Device, ID3D11Texture2D};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
 use windows::Win32::Graphics::OpenGL::{
     GL_BACK, GL_COLOR_BUFFER_BIT, GL_COLOR_CLEAR_VALUE, GL_COLOR_WRITEMASK, GL_DEPTH_BUFFER_BIT, GL_DEPTH_CLEAR_VALUE, GL_DEPTH_WRITEMASK,
     GL_NEAREST, GL_RGBA, GL_RGBA8, GL_SCISSOR_TEST, GL_STENCIL_BUFFER_BIT, GL_STENCIL_CLEAR_VALUE, GL_STENCIL_WRITEMASK, GL_TEXTURE_2D,
@@ -181,6 +181,8 @@ pub struct Bridge {
     /// The depth copy's target (`R32_FLOAT`) and pass, made at the first depth copy.
     depth_target: Option<Target>,
     depth_pass: Option<DepthPass>,
+    /// [`Bridge::capture_floats`]'s target (`R32G32B32A32_FLOAT`), made at its first copy.
+    float_target: Option<Target>,
     /// [`Bridge::capture_eye`]'s slots, made as they are first used.
     eye_slots: Vec<EyeSlot>,
 }
@@ -212,7 +214,7 @@ impl Bridge {
         if interop.is_null() {
             return Err(Error::Failed("wglDXOpenDeviceNV (is the D3D11 device on the GL context's GPU?)"));
         }
-        Ok(Self { gl, device: device.clone(), interop, target: None, depth_target: None, depth_pass: None, eye_slots: Vec::new() })
+        Ok(Self { gl, device: device.clone(), interop, target: None, depth_target: None, depth_pass: None, float_target: None, eye_slots: Vec::new() })
     }
 
     pub fn device(&self) -> &ID3D11Device {
@@ -350,6 +352,41 @@ impl Bridge {
         Ok(&self.target.as_ref().expect("made above").texture)
     }
 
+    /// Copies the `width` x `height` colour of GL framebuffer `source` (a float RGBA one, not the
+    /// back buffer) into a D3D11 `R32G32B32A32_FLOAT` texture, top row first, the values as they
+    /// are. The texture is reused until the size changes.
+    pub fn capture_floats(&mut self, source: u32, width: u32, height: u32) -> Result<&ID3D11Texture2D> {
+        if source == 0 || !monaka_contract::protocol::dimensions_ok(width, height) {
+            return Err(Error::Failed("float capture size"));
+        }
+        let gl = self.gl;
+        let interop = self.interop;
+        let saved = Self::save();
+        let old = self.float_target.take();
+        let target = self.sized(old, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT)?;
+        let (mut object, framebuffer) = (target.object, target.framebuffer);
+        self.float_target = Some(target);
+        let (w, h) = (width as i32, height as i32);
+        // SAFETY: GL calls with the context current, on objects this bridge owns, bracketed by the
+        // interop lock; the state changed is restored before returning.
+        unsafe {
+            if (gl.lock_objects)(interop, 1, &mut object) == 0 {
+                return Err(Error::Failed("wglDXLockObjectsNV"));
+            }
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, source);
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, framebuffer);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_FRAMEBUFFER_SRGB);
+            // GL rows run bottom-up, D3D's top-down: the destination is flipped.
+            (gl.blit_framebuffer)(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            Self::restore(gl, &saved, source);
+            if (gl.unlock_objects)(interop, 1, &mut object) == 0 {
+                return Err(Error::Failed("wglDXUnlockObjectsNV"));
+            }
+        }
+        Ok(&self.float_target.as_ref().expect("kept above").texture)
+    }
+
     /// Puts back the state [`Bridge::save`] read, after a copy from framebuffer `source`.
     ///
     /// # Safety
@@ -478,6 +515,8 @@ impl Bridge {
         self.release_target();
         let depth = self.depth_target.take();
         self.free(depth);
+        let floats = self.float_target.take();
+        self.free(floats);
         for slot in std::mem::take(&mut self.eye_slots) {
             self.free(slot.colour);
             self.free(slot.depth);
